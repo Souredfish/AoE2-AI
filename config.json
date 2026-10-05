@@ -1,0 +1,28 @@
+{
+  "game": {
+    "install_dir": "C:\\Steam\\steamapps\\common\\AoE2DE",
+    "exe": "AoE2DE_s.exe",
+    "ai_dir": "C:\\Steam\\steamapps\\common\\AoE2DE\\resources\\_common\\ai",
+    "base_script": "AiBuilder.per",
+    "recordings_dir": "C:\\Users\\fengy\\Games\\Age of Empires 2 DE\\76561198222089992\\savegame\\multi"
+  },
+  "match": {
+    "difficulty": "hard",
+    "map": "Arabia",
+    "game_speed": "快速",
+    "pop_cap": 200,
+    "note": "进化对局请固定使用 Hard 或以上难度：AiBuilder 的兵种/村民数量参数按难度分支生效，进化的是 *-hard 系列"
+  },
+  "evolution": {
+    "population": 8,
+    "max_generations": 30,
+    "mutation_rate": 0.35,
+    "mutation_sigma": 0.15,
+    "elite_count": 2,
+    "matches_per_ai": 3
+  },
+  "control": {
+    "launcher": "../tools/AoE2Control/AoE2Control.exe",
+    "auto_match_timeout_min": 150
+  }
+}

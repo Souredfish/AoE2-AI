@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 3,
+  "product": "AoE2Control",
+  "version": "1.1.0",
+  "createdUtc": "2026-10-01T22:13:52.8209996Z",
+  "source": {
+    "commit": "c51e9a04d78e8789781203349dc9b93113288180",
+    "clean": true
+  },
+  "protocols": {
+    "modulePackageWriter": 2,
+    "modulePackageReader": [
+      1,
+      2
+    ],
+    "launcherStatusWire": 1
+  },
+  "artifacts": [
+    {
+      "path": "AoE2Control.exe",
+      "size": 23330304,
+      "sha256": "4013965C42227C956E4113923D66D1FC03FB6C7D781262778EA9AD8BFD9472F1",
+      "fileVersion": "1.1.0",
+      "productVersion": "1.1.0"
+    }
+  ],
+  "notices": {
+    "name": "THIRD_PARTY_NOTICES.md",
+    "sha256": "88AD42121F4D1E03A166199E8972AADEBBE218B363585F3A52A37CC6DE7FB68E"
+  }
+}

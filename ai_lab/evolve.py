@@ -19,6 +19,7 @@ evolve.py — 遗传算法主循环（半自动进化流水线）
 
 import argparse
 import json
+import math
 import random
 import subprocess
 import sys
@@ -170,9 +171,11 @@ def cmd_next(args, cfg):
             for j, (n2, _) in enumerate(r["players"]):
                 if n2 != name:
                     opp_sc = scores.get(n2)
-            if isinstance(sc, (int, float)) and isinstance(opp_sc, (int, float)):
+            if (isinstance(sc, (int, float)) and math.isfinite(sc)
+                    and isinstance(opp_sc, (int, float)) and math.isfinite(opp_sc)):
                 margins[gi] += (sc - opp_sc) / 10000.0
-    fitness = [(wins[i] + margins[i], i) for i in range(pop)]
+    fitness = [(wins[i] + margins[i], i) if math.isfinite(wins[i] + margins[i])
+               else (float("-inf"), i) for i in range(pop)]
     fitness.sort(reverse=True)
     print("第 %d 代积分榜（胜场/分差加成）：" % cur)
     for f, i in fitness:
@@ -209,11 +212,18 @@ def cmd_next(args, cfg):
     best_i = fitness[0][1]
     champ = gene_pop[best_i]
     champ_file = gen_dir / "champion.json"
-    prev = json.loads(champ_file.read_text(encoding="utf-8")) if champ_file.exists() else None
-    if prev is None or fitness[0][0] > 0:
+    score_file = gen_dir / "champion_fitness.json"
+    previous_score = _load_champion_fitness(score_file)
+    has_champion = champ_file.exists()
+    if _should_update_champion(fitness[0][0], previous_score, has_champion):
         G.save(champ, champ_file)
+        score_file.write_text(json.dumps({"fitness": fitness[0][0], "generation": cur}, indent=1), encoding="utf-8")
         MK.install("Champion", champ, cfg)
         print("历史最佳基因已更新并安装为 EvoAI_Champion（G%dP%d）" % (cur, best_i))
+    elif has_champion and previous_score is None:
+        print("保留现有冠军：旧冠军档案没有可比较的适应度；本代成绩不会自动替换它。")
+    elif not math.isfinite(fitness[0][0]):
+        print("本代最佳适应度不是有限数值，未写入冠军档案。")
 
     print()
     print("第 %d 代已生成并安装。对战表：" % nxt)
@@ -231,12 +241,31 @@ def _match_individual(name, gen, pop):
 
 
 def _tournament(fitness, k, rng):
-    best = rng.choice(fitness)[1]
+    """With-replacement tournament; fitness rows are (score, individual_index)."""
+    best_score, best = rng.choice(fitness)
     for _ in range(k - 1):
-        cand = rng.choice(fitness)[1]
-        if cand < best:
-            best = cand
+        score, candidate = rng.choice(fitness)
+        if score > best_score:
+            best_score, best = score, candidate
     return best
+
+
+def _should_update_champion(candidate_fitness, previous_fitness, has_champion):
+    """Legacy champions lack scores, so preserve them until manually evaluated."""
+    if not math.isfinite(candidate_fitness):
+        return False
+    if not has_champion:
+        return True
+    return previous_fitness is not None and candidate_fitness > previous_fitness
+
+
+def _load_champion_fitness(path):
+    """Return only finite champion scores; malformed or legacy metadata is unknown."""
+    try:
+        fitness = float(json.loads(path.read_text(encoding="utf-8"))["fitness"])
+    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return fitness if math.isfinite(fitness) else None
 
 
 # ------------------------------------------------------------------

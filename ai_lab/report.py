@@ -53,8 +53,8 @@ def parse_record(path):
     except Exception:
         info["map"] = "?"
     try:
-        dur = s.get_duration()
-        info["duration_min"] = round(dur / 60.0, 1) if dur else None
+        duration_ms = s.get_duration()
+        info["duration_min"] = round(duration_ms / 60000.0, 1) if duration_ms else None
     except Exception:
         info["duration_min"] = None
     try:
@@ -110,13 +110,15 @@ def parse_record(path):
 def fmt_duration(mins):
     if mins is None:
         return "?"
-    return "%d分%02d秒" % (mins, (mins % 1) * 60)
+    total_seconds = max(0, int(round(float(mins) * 60)))
+    minutes, seconds = divmod(total_seconds, 60)
+    return "%d分%02d秒" % (minutes, seconds)
 
 
 def render_markdown(info):
     lines = []
-    lines.append("# 战报：%s vs %s" % (
-        " vs ".join(p["name"] for p in info["players"][:2]) or "未知对局"))
+    matchup = " vs ".join(p["name"] for p in info["players"][:2]) or "未知对局"
+    lines.append("# 战报：%s" % matchup)
     lines.append("")
     lines.append("- 地图: %s" % info.get("map", "?"))
     lines.append("- 时长: %s" % fmt_duration(info.get("duration_min")))

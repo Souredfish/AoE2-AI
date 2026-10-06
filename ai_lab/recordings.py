@@ -47,4 +47,12 @@ def list_recordings(cfg, environ=None):
 
 def latest_recording(cfg, environ=None):
     recordings = list_recordings(cfg, environ).values()
-    return max(recordings, key=lambda path: path.stat().st_mtime) if recordings else None
+    # File timestamp resolution can tie on Windows; use the normalized path as
+    # a stable secondary key so discovery does not depend on directory order.
+    return max(
+        recordings,
+        key=lambda path: (
+            path.stat().st_mtime_ns,
+            os.path.normcase(os.path.abspath(str(path))),
+        ),
+    ) if recordings else None

@@ -1,3 +1,4 @@
+import os
 import sys
 import tempfile
 import types
@@ -21,10 +22,29 @@ class RecordingPathTests(unittest.TestCase):
             latest = savegame / "newer.aoe2record"
             old.write_bytes(b"old")
             latest.write_bytes(b"new")
+            old_ns = 1_700_000_000_000_000_000
+            os.utime(old, ns=(old_ns, old_ns))
+            os.utime(latest, ns=(old_ns + 60_000_000_000, old_ns + 60_000_000_000))
             cfg = {"game": {"recordings_dir": str(stale)}}
 
             self.assertEqual(latest_recording(cfg, {"USERPROFILE": str(profile)}), latest)
             self.assertEqual(len(list_recordings(cfg, {"USERPROFILE": str(profile)})), 2)
+
+    def test_latest_recording_breaks_equal_timestamp_ties_by_normalized_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            profile = Path(tmp)
+            multi = profile / "Games" / "Age of Empires 2 DE" / "profile-1" / "savegame" / "multi"
+            multi.mkdir(parents=True)
+            first = multi / "a.aoe2record"
+            last = multi / "z.aoe2record"
+            first.write_bytes(b"a")
+            last.write_bytes(b"z")
+            tie_ns = 1_700_000_000_000_000_000
+            os.utime(first, ns=(tie_ns, tie_ns))
+            os.utime(last, ns=(tie_ns, tie_ns))
+            cfg = {"game": {}}
+
+            self.assertEqual(latest_recording(cfg, {"USERPROFILE": str(profile)}), last)
 
 
 class MgzPlayerParsingTests(unittest.TestCase):
@@ -53,7 +73,7 @@ class MgzPlayerParsingTests(unittest.TestCase):
                 return {"name": "Arabia"}
 
             def get_duration(self):
-                return 600
+                return 3_923_000
 
             def get_players(self):
                 return [{"name": "Observer"}, {"name": "EvoAI_A"}, {"name": "EvoAI_B"}]
@@ -71,6 +91,24 @@ class MgzPlayerParsingTests(unittest.TestCase):
         self.assertEqual([player["name"] for player in info["players"]], ["Observer", "EvoAI_A", "EvoAI_B"])
         self.assertEqual(info["players"][1]["score"], 1400)
         self.assertEqual(info["winners"], [])
+        self.assertEqual(info["duration_min"], 65.4)
+
+    def test_render_markdown_title_and_duration(self):
+        info = {
+            "file": "/records/test.aoe2record",
+            "mtime": 0,
+            "map": "Arabia",
+            "duration_min": 65.4,
+            "players": [{"name": "Observer"}, {"name": "EvoAI_A"}, {"name": "EvoAI_B"}],
+            "winners": [],
+        }
+
+        rendered = report.render_markdown(info)
+
+        self.assertTrue(rendered.startswith("# 战报：Observer vs EvoAI_A"))
+        self.assertIn("- 时长: 65分24秒", rendered)
+        self.assertIn("| EvoAI_B |", rendered)
+        self.assertEqual(report.fmt_duration(None), "?")
 
 
 if __name__ == "__main__":

@@ -167,6 +167,23 @@ def result_row_from_report(info, gen, pop, manifest, accepted,
     if len(winner_ids) != 1 or winner_ids[0] not in indices:
         raise ValueError("战报胜者无效或无法唯一确定；必须且只能有一个参赛胜者")
 
+    player_winner_ids = []
+    has_player_winner_flags = False
+    for player in info.get("players", []):
+        if "winner" not in player:
+            continue
+        has_player_winner_flags = True
+        flag = player["winner"]
+        if not isinstance(flag, bool):
+            raise ValueError("战报玩家胜者标记必须是布尔值")
+        if flag:
+            player_id = ER.individual_from_name(player.get("name"), gen, pop)
+            if player_id not in indices:
+                raise ValueError("战报非参赛玩家不能标记为胜者")
+            player_winner_ids.append(player_id)
+    if has_player_winner_flags and player_winner_ids != winner_ids:
+        raise ValueError("玩家胜者标记与战报 winners 不一致")
+
     winner = ER.individual_name(gen, winner_ids[0])
     players = scheduled["players"]
     scores = {}

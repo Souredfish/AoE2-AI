@@ -37,6 +37,33 @@ class ReportLedgerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "只能有一个参赛胜者"):
             evolve.result_row_from_report(info, 4, 8, self.manifest, {})
 
+    def test_conflicting_player_winner_flag_is_rejected(self):
+        info = {"players": [
+            {"name": "EvoAI_G4P7", "winner": False, "score": 2100},
+            {"name": "EvoAI_G4P2", "winner": True, "score": 1850},
+        ], "winners": ["EvoAI_G4P7"]}
+
+        with self.assertRaisesRegex(ValueError, "玩家胜者标记与战报 winners 不一致"):
+            evolve.result_row_from_report(info, 4, 8, self.manifest, {})
+
+    def test_all_false_player_winner_flags_conflict_with_report_winner(self):
+        info = {"players": [
+            {"name": "EvoAI_G4P7", "winner": False, "score": 2100},
+            {"name": "EvoAI_G4P2", "winner": False, "score": 1850},
+        ], "winners": ["EvoAI_G4P7"]}
+
+        with self.assertRaisesRegex(ValueError, "玩家胜者标记与战报 winners 不一致"):
+            evolve.result_row_from_report(info, 4, 8, self.manifest, {})
+
+    def test_non_boolean_player_winner_flag_is_rejected(self):
+        info = {"players": [
+            {"name": "EvoAI_G4P7", "winner": 1, "score": 2100},
+            {"name": "EvoAI_G4P2", "winner": False, "score": 1850},
+        ], "winners": ["EvoAI_G4P7"]}
+
+        with self.assertRaisesRegex(ValueError, "胜者标记必须是布尔值"):
+            evolve.result_row_from_report(info, 4, 8, self.manifest, {})
+
     def test_report_with_invalid_score_is_rejected_by_ledger_validation(self):
         info = {"players": [
             {"name": "EvoAI_G4P7", "winner": True, "score": 2100},

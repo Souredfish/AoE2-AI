@@ -1,13 +1,19 @@
 import json
+import queue
+import sys
 import tempfile
+import threading
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 from pathlib import Path
 
 from ai_lab.result_capture_ipc import (CaptureIPCRejected, append_capture_association,
                                        append_raw_capture,
                                        load_raw_capture, parse_ipc_envelope,
                                        WindowsPipeCaptureReceiver, _binding_request,
-                                       _is_capture_ready)
+                                       _capture_hello_request, _is_capture_ready,
+                                       _send_capture_hellos)
 
 
 def envelope(payload=None, source=None):
@@ -112,10 +118,135 @@ class ResultCaptureIPCTests(unittest.TestCase):
         ready["payload"]["protocol_version"] = 2
         self.assertFalse(_is_capture_ready(ready))
 
+    def test_client_repeats_hello_until_server_ready(self):
+        ready = threading.Event()
+        stop = threading.Event()
+        sent = []
+
+        def write(payload):
+            sent.append(json.loads(payload))
+            if len(sent) == 3:
+                ready.set()
+
+        attempts = _send_capture_hellos(write, ready, stop, interval_s=0)
+        self.assertEqual(attempts, 3)
+        self.assertEqual([item["payload"]["action"] for item in sent],
+                         ["capture_hello"] * 3)
+        self.assertEqual(sent[0], _capture_hello_request())
+        self.assertEqual(sent[0]["target"], {
+            "assignedPlayerId": 1, "moduleName": "evolab_driver"})
+        self.assertEqual(sent[0]["payload"]["protocol_version"], 1)
+
     def test_binding_wait_times_out_without_confirmation(self):
-        receiver = WindowsPipeCaptureReceiver("unused.jsonl", "g0-m0001")
-        with self.assertRaisesRegex(CaptureIPCRejected, "握手阶段=connecting"):
-            receiver.wait_until_bound(0.001)
+        for phase in ("connecting", "waiting_for_control_ready", "waiting_for_match_bound"):
+            receiver = WindowsPipeCaptureReceiver("unused.jsonl", "g0-m0001")
+            receiver._handshake_phase = phase
+            with self.subTest(phase=phase):
+                with self.assertRaisesRegex(CaptureIPCRejected,
+                                            "握手阶段=" + phase):
+                    receiver.wait_until_bound(0.001)
+
+    def test_lua_logs_startserver_and_each_handshake_stage(self):
+        source = (Path(__file__).parents[1] / "ai_lab/control/evolab_driver/"
+                  "evolab_driver.main.lua").read_text(encoding="utf-8")
+        for marker in (
+                "lifecycle Load", "lifecycle Init", "IPC StartServer result",
+                "capture_ready queued after client hello", "binding acknowledgement failed",
+                "runner match_id bound", 'start_capture_ipc_server("Load")'):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, source)
+
+    def test_pipe_handshake_connect_ready_bind_ack_sequence(self):
+        responses = queue.Queue()
+        written = []
+        events = []
+        receiver = WindowsPipeCaptureReceiver(
+            "unused.jsonl", "g0-m0001", diagnostic=events.append)
+
+        class FakePipeError(Exception):
+            def __init__(self, winerror):
+                super().__init__(winerror)
+                self.winerror = winerror
+
+        def write_file(_handle, raw):
+            message = json.loads(raw.decode("utf-8"))
+            written.append(message)
+            action = message["payload"]["action"]
+            if action == "capture_hello":
+                payload = {"action": "capture_ready", "protocol_version": 1}
+            else:
+                payload = {"action": "match_bound", "match_id": "g0-m0001"}
+            responses.put(json.dumps({
+                "type": "module_message", "pipeName": "EvoLabResultCaptureV1",
+                "source": {"moduleName": "evolab_driver", "assignedPlayerId": 1},
+                "payload": payload,
+            }).encode("utf-8"))
+
+        def read_file(_handle, _size):
+            raw = responses.get(timeout=1)
+            envelope = json.loads(raw.decode("utf-8"))
+            if envelope["payload"]["action"] == "match_bound":
+                receiver._stop.set()
+            return 0, raw
+
+        fake_file = SimpleNamespace(
+            GENERIC_READ=1, GENERIC_WRITE=2, OPEN_EXISTING=3,
+            CreateFile=lambda *_args: "fake-pipe", WriteFile=write_file,
+            ReadFile=read_file, CloseHandle=lambda _handle: None,
+        )
+        fake_pipe = SimpleNamespace(
+            PIPE_READMODE_MESSAGE=1,
+            SetNamedPipeHandleState=lambda *_args: None,
+        )
+        fake_winerror = SimpleNamespace(error=FakePipeError)
+        with patch.dict(sys.modules, {
+                "pywintypes": fake_winerror,
+                "win32file": fake_file,
+                "win32pipe": fake_pipe,
+        }):
+            receiver._receive()
+            receiver.stop()
+
+        self.assertEqual(receiver.handshake_phase, "bound")
+        self.assertEqual([m["payload"]["action"] for m in written],
+                         ["capture_hello", "bind_match"])
+        stages = [event["stage"] for event in events]
+        for stage in ("pipe_connected", "capture_hello_sent", "capture_ready_received",
+                      "bind_match_sent", "match_bound_received"):
+            self.assertIn(stage, stages)
+        self.assertLess(stages.index("pipe_connected"), stages.index("capture_ready_received"))
+        self.assertLess(stages.index("capture_ready_received"), stages.index("bind_match_sent"))
+        self.assertLess(stages.index("bind_match_sent"), stages.index("match_bound_received"))
+
+    def test_missing_server_reports_connect_timeout(self):
+        events = []
+
+        class FakePipeError(Exception):
+            winerror = 2
+
+        def missing_pipe(*_args):
+            raise FakePipeError("pipe not found")
+
+        fake_file = SimpleNamespace(
+            GENERIC_READ=1, GENERIC_WRITE=2, OPEN_EXISTING=3,
+            CreateFile=missing_pipe,
+        )
+        fake_pipe = SimpleNamespace(PIPE_READMODE_MESSAGE=1)
+        fake_winerror = SimpleNamespace(error=FakePipeError)
+        receiver = WindowsPipeCaptureReceiver(
+            "unused.jsonl", "g0-m0001", connect_timeout_s=0, diagnostic=events.append)
+        with patch.dict(sys.modules, {
+                "pywintypes": fake_winerror,
+                "win32file": fake_file,
+                "win32pipe": fake_pipe,
+        }):
+            receiver._receive()
+
+        self.assertEqual(receiver.handshake_phase, "failed")
+        self.assertTrue(any(e["stage"] == "connect_timeout" and e["winerror"] == 2
+                            for e in events))
+        self.assertTrue(any(e["stage"] == "handshake_failed"
+                            and "TimeoutError" in e["error"] for e in events))
 
 
 if __name__ == "__main__":

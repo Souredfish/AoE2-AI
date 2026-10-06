@@ -36,6 +36,7 @@ local capture_enabled = false
 local capture_ipc_started = { ok = false, error = "PoC not enabled" }
 local capture_match_id = nil
 local capture_sequence = 0
+local capture_ready_logged = false
 local captured_game_speed_set = { ok = false, error = "PoC not enabled" }
 local captured_game_speed_readback = { ok = false, error = "PoC not enabled" }
 
@@ -101,6 +102,33 @@ local function capture_victory_player()
     }
 end
 
+local function start_capture_ipc_server(lifecycle_stage)
+    if not capture_enabled then
+        Log("EvoLab PoC IPC server skipped: " .. tostring(lifecycle_stage) .. " setting=false")
+        return
+    end
+    local ok, started = pcall(function() return IPC.StartServer(RESULT_CAPTURE_PIPE) end)
+    local start_error = nil
+    if not ok then
+        start_error = tostring(started)
+    elseif started ~= true then
+        start_error = "IPC.StartServer returned false"
+    end
+    capture_ipc_started = {
+        call_ok = ok,
+        started = started == true,
+        ok = ok and started == true,
+        error = start_error,
+    }
+    Log("EvoLab PoC IPC StartServer result: " .. ToJSON({
+        lifecycle_stage = lifecycle_stage,
+        pipe = RESULT_CAPTURE_PIPE,
+        call_ok = capture_ipc_started.call_ok,
+        server_started = capture_ipc_started.started,
+        error = capture_ipc_started.error,
+    }))
+end
+
 function Load(playerId)
     Settings.AddBool("AutoDrive", true)
     Settings.AddBool(RESULT_CAPTURE_SETTING, false)
@@ -108,6 +136,12 @@ function Load(playerId)
         return  -- 本模块只由玩家 1 的槽位驱动，其他槽位误挂时静默退出
     end
     capture_enabled = Settings.GetBool(RESULT_CAPTURE_SETTING, false)
+    Log("EvoLab PoC lifecycle Load: " .. ToJSON({
+        assigned_player_id = playerId,
+        capture_enabled = capture_enabled,
+        auto_drive = Settings.GetBool("AutoDrive", true),
+    }))
+    start_capture_ipc_server("Load")
     if not Settings.GetBool("AutoDrive", true) then
         Log("EvoLab: AutoDrive 已关闭，待机。")
         return
@@ -155,16 +189,12 @@ function Load(playerId)
 end
 
 function Init()
+    Log("EvoLab PoC lifecycle Init: " .. ToJSON({
+        assigned_player_id = GetAssignedPlayerId(),
+        capture_enabled = capture_enabled,
+    }))
     if GetAssignedPlayerId() ~= 1 then
         return
-    end
-    if capture_enabled then
-        local ok, started = pcall(function() return IPC.StartServer(RESULT_CAPTURE_PIPE) end)
-        capture_ipc_started = {
-            ok = ok and started == true,
-            error = not ok and tostring(started) or (started and nil or "IPC.StartServer returned false"),
-        }
-        Log("EvoLab PoC IPC server: " .. ToJSON(capture_ipc_started))
     end
     if CFG.spectate_mode ~= "eliminate" then
         return
@@ -183,26 +213,27 @@ function Update()
     if not capture_enabled or not capture_ipc_started.ok then
         return
     end
-    -- Let the client know the server is live before asking it to bind this
-    -- match. Avoid queuing unsolicited messages when nobody is connected.
-    local stats_ok, stats = pcall(function() return IPC.GetStats() end)
-    if stats_ok and type(stats) == "table" and type(stats.connectedClients) == "number"
-        and stats.connectedClients > 0
-        and capture_match_id == nil then
-        local ready_ok, queued = pcall(function()
-            return IPC.Send({ action = "capture_ready", protocol_version = 1 })
-        end)
-        if not ready_ok or queued ~= true then
-            Log("EvoLab PoC IPC ready announcement failed: " .. tostring(queued))
-        end
-    end
     local ok, messages = pcall(function() return IPC.GetMessages() end)
     if not ok or type(messages) ~= "table" then
+        Log("EvoLab PoC IPC GetMessages failed: " .. tostring(messages))
         return
     end
     for _, raw in ipairs(messages) do
         local parsed = ParseJSON(raw)
-        if type(parsed) == "table" and parsed.action == "bind_match"
+        if type(parsed) == "table" and parsed.action == "capture_hello"
+            and parsed.protocol_version == 1 then
+            local ready_ok, queued = pcall(function()
+                return IPC.Send({ action = "capture_ready", protocol_version = 1 })
+            end)
+            if ready_ok and queued == true then
+                if not capture_ready_logged then
+                    Log("EvoLab PoC IPC capture_ready queued after client hello")
+                    capture_ready_logged = true
+                end
+            else
+                Log("EvoLab PoC IPC capture_ready send failed: " .. tostring(queued))
+            end
+        elseif type(parsed) == "table" and parsed.action == "bind_match"
             and type(parsed.match_id) == "string" and parsed.match_id ~= ""
             and (capture_match_id == nil or capture_match_id == parsed.match_id) then
             local sent_ok, queued = pcall(function()

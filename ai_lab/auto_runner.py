@@ -716,12 +716,16 @@ def main():
     capture_receiver = None
     if args.capture_only:
         raw_path = raw_capture_path(LAB / "runner_evidence", schedule[0]["match_id"])
-        capture_receiver = WindowsPipeCaptureReceiver(raw_path, schedule[0]["match_id"])
+        def log_capture_ipc(event):
+            print("[PoC IPC] " + json.dumps(event, ensure_ascii=False, sort_keys=True))
+
+        capture_receiver = WindowsPipeCaptureReceiver(
+            raw_path, schedule[0]["match_id"], diagnostic=log_capture_ipc)
         try:
             capture_receiver.start()
         except OSError as e:
             sys.exit("[PoC 拒绝] 无法启动 AoE2Control IPC 采集器：%s" % e)
-        print("[PoC IPC] 等待 CONTROL named pipe；原始 sentinel 将只追加到 %s" % raw_path)
+        print("[PoC IPC] 等待 CONTROL pipe、capture_ready、match_bound；原始 sentinel 将只追加到 %s" % raw_path)
         try:
             bound = capture_receiver.wait_until_bound(20)
         except CaptureIPCRejected as e:
@@ -729,7 +733,7 @@ def main():
             sys.exit("[PoC 拒绝] 无法绑定本场 match_id：%s" % e)
         if not bound:
             capture_receiver.stop()
-            sys.exit("[PoC 拒绝] 20 秒内未收到 CONTROL 对本场 match_id 的绑定确认")
+            sys.exit("[PoC 拒绝] CONTROL IPC 握手未完成")
     for idx, match in enumerate(schedule):
         a, b = [EV.ER.individual_from_name(n, gen, pop) for n in match["players"]]
         if a is None or b is None:

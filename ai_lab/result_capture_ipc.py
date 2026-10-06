@@ -64,6 +64,13 @@ def _is_capture_ready(envelope):
             and payload.get("protocol_version") == 1)
 
 
+def _capture_hello_request():
+    return {
+        "target": {"assignedPlayerId": 1, "moduleName": "evolab_driver"},
+        "payload": {"action": "capture_hello", "protocol_version": 1},
+    }
+
+
 def _binding_request(match_id):
     if not isinstance(match_id, str) or not match_id.strip():
         raise CaptureIPCRejected("runner match_id 为空，不能请求 IPC 绑定")
@@ -71,6 +78,21 @@ def _binding_request(match_id):
         "target": {"assignedPlayerId": 1, "moduleName": "evolab_driver"},
         "payload": {"action": "bind_match", "match_id": match_id},
     }
+
+
+def _send_capture_hellos(write, ready_event, stop_event, interval_s=0.5,
+                         on_attempt=None):
+    """Repeat hello until CONTROL answers or the bounded receiver stops."""
+    attempts = 0
+    encoded = json.dumps(_capture_hello_request()).encode("utf-8")
+    while not ready_event.is_set() and not stop_event.is_set():
+        write(encoded)
+        attempts += 1
+        if on_attempt is not None:
+            on_attempt(attempts)
+        if ready_event.wait(interval_s) or stop_event.is_set():
+            break
+    return attempts
 
 
 def parse_ipc_envelope(message):
@@ -213,26 +235,38 @@ def load_raw_capture(path, expected_match_id, expected_association=None):
 class WindowsPipeCaptureReceiver:
     """Connect to the CONTROL IPC server and persist each received source frame."""
 
-    def __init__(self, path, match_id, connect_timeout_s=600):
+    def __init__(self, path, match_id, connect_timeout_s=600, diagnostic=None):
         self.path = Path(path)
         self.match_id = match_id
         self.connect_timeout_s = connect_timeout_s
         self._stop = threading.Event()
         self._received = threading.Event()
         self._bound = threading.Event()
+        self._ready = threading.Event()
         self._thread = None
+        self._hello_thread = None
         self._handle = None
         self._error = None
         self._row = None
         self._handshake_phase = "connecting"
+        self._diagnostic = diagnostic
+        self._write_lock = threading.Lock()
+        self._connection_attempts = 0
+        self._hello_attempts = 0
+        self._binding_sent = False
 
     @property
     def handshake_phase(self):
         return self._handshake_phase
 
+    def _emit(self, stage, **details):
+        if self._diagnostic is not None:
+            self._diagnostic({"stage": stage, "phase": self._handshake_phase, **details})
+
     def start(self):
         if os.name != "nt":
             raise OSError("AoE2Control named-pipe capture is Windows-only")
+        self._emit("connect_started", pipe=PIPE_PATH)
         self._thread = threading.Thread(
             target=self._receive, name="AoE2ControlCaptureIPC", daemon=True)
         self._thread.start()
@@ -246,6 +280,7 @@ class WindowsPipeCaptureReceiver:
         try:
             while not self._stop.is_set():
                 try:
+                    self._connection_attempts += 1
                     self._handle = win32file.CreateFile(
                         PIPE_PATH, win32file.GENERIC_READ | win32file.GENERIC_WRITE, 0, None,
                         win32file.OPEN_EXISTING, 0, None)
@@ -254,14 +289,22 @@ class WindowsPipeCaptureReceiver:
                     if exc.winerror not in (2, 231):
                         raise
                     if time.monotonic() >= deadline:
+                        self._emit("connect_timeout", attempts=self._connection_attempts,
+                                   winerror=exc.winerror)
                         raise TimeoutError("等待 AoE2Control IPC 命名管道超时")
+                    if self._connection_attempts == 1 or self._connection_attempts % 20 == 0:
+                        self._emit("connect_retry", attempts=self._connection_attempts,
+                                   winerror=exc.winerror)
                     self._stop.wait(0.5)
             if self._stop.is_set():
                 return
             self._handshake_phase = "waiting_for_control_ready"
+            self._emit("pipe_connected", attempts=self._connection_attempts)
             win32pipe.SetNamedPipeHandleState(
                 self._handle, win32pipe.PIPE_READMODE_MESSAGE, None, None)
-            binding_sent = False
+            self._hello_thread = threading.Thread(
+                target=self._send_hellos, name="AoE2ControlCaptureHello", daemon=True)
+            self._hello_thread.start()
             while not self._stop.is_set():
                 parts = []
                 while True:
@@ -274,21 +317,26 @@ class WindowsPipeCaptureReceiver:
                 envelope = _decode_envelope(b"".join(parts).decode("utf-8"))
                 payload = envelope.get("payload")
                 if _is_capture_ready(envelope):
-                    if not binding_sent:
+                    self._ready.set()
+                    self._emit("capture_ready_received", hello_attempts=self._hello_attempts)
+                    if not self._binding_sent:
                         binding = _binding_request(self.match_id)
-                        win32file.WriteFile(
-                            self._handle, json.dumps(binding).encode("utf-8"))
-                        binding_sent = True
+                        with self._write_lock:
+                            win32file.WriteFile(
+                                self._handle, json.dumps(binding).encode("utf-8"))
+                        self._binding_sent = True
                         self._handshake_phase = "waiting_for_match_bound"
+                        self._emit("bind_match_sent", match_id=self.match_id)
                     continue
                 if (isinstance(payload, dict) and payload.get("action") == "match_bound"
                         and payload.get("match_id") == self.match_id):
-                    if not binding_sent:
+                    if not self._binding_sent:
                         raise CaptureIPCRejected("收到绑定确认前未发送 runner bind_match")
                     if self._bound.is_set():
                         raise CaptureIPCRejected("重复收到 runner match_id 绑定确认")
                     self._bound.set()
                     self._handshake_phase = "bound"
+                    self._emit("match_bound_received", match_id=self.match_id)
                     continue
                 if not self._bound.is_set():
                     raise CaptureIPCRejected("收到原始 sentinel 前未确认 runner match_id 绑定")
@@ -298,6 +346,28 @@ class WindowsPipeCaptureReceiver:
         except Exception as exc:
             self._error = exc
             self._handshake_phase = "failed"
+            self._emit("handshake_failed", error="%s: %s" % (type(exc).__name__, exc))
+            self._bound.set()
+            self._received.set()
+
+    def _send_hellos(self):
+        import win32file
+
+        def write(encoded):
+            with self._write_lock:
+                win32file.WriteFile(self._handle, encoded)
+
+        def attempted(count):
+            self._hello_attempts = count
+            if count == 1 or count % 5 == 0:
+                self._emit("capture_hello_sent", attempts=count)
+
+        try:
+            _send_capture_hellos(write, self._ready, self._stop, on_attempt=attempted)
+        except Exception as exc:
+            self._error = exc
+            self._handshake_phase = "failed"
+            self._emit("hello_send_failed", error="%s: %s" % (type(exc).__name__, exc))
             self._bound.set()
             self._received.set()
 
@@ -311,6 +381,7 @@ class WindowsPipeCaptureReceiver:
         if not self._bound.wait(timeout_s):
             if self._error is not None:
                 raise CaptureIPCRejected("runner match_id 绑定失败：%s" % self._error) from self._error
+            self._emit("handshake_timeout", timeout_s=timeout_s)
             raise CaptureIPCRejected(
                 "runner match_id 绑定超时，握手阶段=%s" % self._handshake_phase)
         if self._error is not None:
@@ -325,6 +396,10 @@ class WindowsPipeCaptureReceiver:
                 win32file.CloseHandle(self._handle)
             except Exception:
                 pass
+        if self._hello_thread is not None:
+            self._hello_thread.join(timeout=2)
+            if self._hello_thread.is_alive():
+                raise RuntimeError("AoE2Control IPC hello 线程未能有界退出")
         if self._thread is not None:
             self._thread.join(timeout=5)
             if self._thread.is_alive():

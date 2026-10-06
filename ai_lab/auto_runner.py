@@ -23,6 +23,7 @@ auto_runner.py — 全自动跑局（AoE2Control 驱动）
 
 import argparse
 import json
+import math
 import random
 import shutil
 import subprocess
@@ -161,29 +162,46 @@ def wait_new_recording(cfg, before, timeout_min):
     return None
 
 
-def resolve_winner(info, gen, a, b):
-    """Map replay AI identities to the genomes installed in EvoAI_A and EvoAI_B."""
-    identity_to_genome = {
-        "EvoAI_A": "EvoAI_G%dP%d" % (gen, a),
-        "EvoAI_B": "EvoAI_G%dP%d" % (gen, b),
-    }
+def _players_by_identity(info):
+    """Index the two replay AIs by their stable installed slot names."""
     players_by_identity = {}
     for player in info.get("players", []):
-        # The replay order can differ from the lobby slot order. The stable AI
-        # name is the identity; the list index is not.
         name = str(player.get("name", ""))
-        identity = next((key for key in identity_to_genome if key in name), None)
+        identity = next((key for key in ("EvoAI_A", "EvoAI_B") if key in name), None)
         if identity:
             if identity in players_by_identity:
                 return None
             players_by_identity[identity] = player
+    if set(players_by_identity) != {"EvoAI_A", "EvoAI_B"}:
+        return None
+    return players_by_identity
 
-    if set(players_by_identity) != set(identity_to_genome):
+
+def _valid_score(value):
+    return value is None or (
+        isinstance(value, (int, float)) and not isinstance(value, bool)
+        and (isinstance(value, int) or math.isfinite(value))
+    )
+
+
+def resolve_winner(info, gen, a, b):
+    """Map one unambiguous replay winner to its installed genome identity."""
+    identity_to_genome = {
+        "EvoAI_A": "EvoAI_G%dP%d" % (gen, a),
+        "EvoAI_B": "EvoAI_G%dP%d" % (gen, b),
+    }
+    players_by_identity = _players_by_identity(info)
+    if players_by_identity is None:
         return None
 
-    for identity, player in players_by_identity.items():
-        if player.get("winner"):
-            return identity_to_genome[identity]
+    if any(not _valid_score(player.get("score")) for player in players_by_identity.values()):
+        return None
+    explicit_winners = [identity for identity, player in players_by_identity.items()
+                        if player.get("winner") is True]
+    if len(explicit_winners) > 1:
+        return None
+    if explicit_winners:
+        return identity_to_genome[explicit_winners[0]]
 
     # If the replay has no explicit winner marker, compare scores by identity.
     score_a = players_by_identity["EvoAI_A"].get("score")
@@ -193,6 +211,33 @@ def resolve_winner(info, gen, a, b):
         identity = "EvoAI_A" if score_a > score_b else "EvoAI_B"
         return identity_to_genome[identity]
     return None
+
+
+def match_result_from_replay(info, gen, a, b, match, record, record_id):
+    """Build one ledger row, rejecting ambiguous winners and invalid scores."""
+    na, nb = "EvoAI_G%dP%d" % (gen, a), "EvoAI_G%dP%d" % (gen, b)
+    players_by_identity = _players_by_identity(info)
+    if players_by_identity is None:
+        raise ValueError("录像未能唯一映射到 EvoAI_A 与 EvoAI_B")
+    if any(not _valid_score(player.get("score"))
+           for player in players_by_identity.values()):
+        raise ValueError("录像比分必须是有限数值或缺失")
+    winner_name = resolve_winner(info, gen, a, b)
+    if winner_name not in (na, nb):
+        raise ValueError("录像胜者无效、多个胜者或无法唯一判定")
+    scores = {
+        na: players_by_identity["EvoAI_A"].get("score"),
+        nb: players_by_identity["EvoAI_B"].get("score"),
+    }
+    return {
+        "match_id": match["match_id"],
+        "players": [[na, winner_name == na], [nb, winner_name == nb]],
+        "winners": [winner_name],
+        "scores": scores,
+        "duration_min": info.get("duration_min"),
+        "record": str(record),
+        "record_id": record_id,
+    }
 
 
 # ------------------------------------------------------------------
@@ -293,28 +338,15 @@ def main():
             info = {"players": [], "winners": []}
             print("[警告] 录像解析失败: %s" % e)
 
-        winner_name = resolve_winner(info, gen, a, b)
         na, nb = "EvoAI_G%dP%d" % (gen, a), "EvoAI_G%dP%d" % (gen, b)
-        scores = {}
-        players = info.get("players", [])
-        for p in players:
-            name = str(p.get("name", ""))
-            if "EvoAI_A" in name:
-                scores[na] = p.get("score")
-            elif "EvoAI_B" in name:
-                scores[nb] = p.get("score")
-        if winner_name not in (na, nb):
-            print("[拒绝] 未能唯一判定本局胜者；录像保留，账本不推进。修正胜者后重新运行。")
+        try:
+            result = match_result_from_replay(
+                info, gen, a, b, match, rec.resolve(), EV.ER.match_id_for_recording(rec))
+        except ValueError as e:
+            print("[拒绝] %s；录像保留，账本不推进。修正录像结果后重新运行。" % e)
             break
-        results.append({
-            "match_id": match["match_id"],
-            "players": [[na, winner_name == na], [nb, winner_name == nb]],
-            "winners": [winner_name] if winner_name else [],
-            "scores": scores,
-            "duration_min": info.get("duration_min"),
-            "record": str(rec.resolve()),
-            "record_id": EV.ER.match_id_for_recording(rec),
-        })
+        winner_name = result["winners"][0]
+        results.append(result)
         try:
             EV.ER.reconcile_results(results, manifest)
         except ValueError as e:

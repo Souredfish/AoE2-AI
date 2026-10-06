@@ -1,6 +1,7 @@
 """Stable schedules and validation for generation result ledgers."""
 import hashlib
 import json
+import math
 import re
 from pathlib import Path
 
@@ -106,6 +107,32 @@ def _record_key(value):
     return str(Path(value).expanduser().resolve()).casefold()
 
 
+def _validate_result_details(row, names, winner):
+    players = row.get("players")
+    has_winner_flags = any(isinstance(item, (list, tuple)) and len(item) > 1
+                           for item in players)
+    if has_winner_flags:
+        if not all(isinstance(item, (list, tuple)) and len(item) > 1 for item in players):
+            raise ValueError("账本玩家胜者标记必须完整")
+        flags = [item[1] for item in players]
+        if (not all(isinstance(flag, bool) for flag in flags)
+                or sum(flags) != 1
+                or names[flags.index(True)] != winner):
+            raise ValueError("账本玩家胜者标记必须与唯一胜者一致")
+
+    scores = row.get("scores")
+    if scores is not None:
+        if not isinstance(scores, dict):
+            raise ValueError("账本比分必须是对象")
+        if any(name not in names for name in scores):
+            raise ValueError("账本比分包含非参赛个体")
+        for name, score in scores.items():
+            if score is not None and (
+                    not isinstance(score, (int, float)) or isinstance(score, bool)
+                    or (isinstance(score, float) and not math.isfinite(score))):
+                raise ValueError("账本比分必须是有限数值或缺失: %s" % name)
+
+
 def reconcile_results(results, manifest):
     """Validate and normalize legacy rows; return rows indexed by scheduled match."""
     if not isinstance(results, list):
@@ -137,6 +164,7 @@ def reconcile_results(results, manifest):
         winners = row.get("winners")
         if not isinstance(winners, list) or len(winners) != 1 or winners[0] not in match["players"]:
             raise ValueError("单局 %s 的胜者无效，必须且只能是一个参赛个体" % match_id)
+        _validate_result_details(row, names, winners[0])
         record_id = row.get("record_id")
         if record_id is not None and not isinstance(record_id, str):
             raise ValueError("录像标识格式无效")

@@ -15,6 +15,7 @@ make_ai.py — 把基因组渲染成可上场的 AI
 """
 
 import argparse
+from collections import Counter
 import hashlib
 import json
 import random
@@ -95,15 +96,16 @@ def build_per_text(base_text, gene, name):
     """校验 AiBuilder 参数面版本并完整替换后返回生成脚本。"""
     gene = G._normalize(G.clamp(gene))
     expected = expected_constants()
-    actual = set(CONSTANT_RE.findall(base_text))
+    definitions = Counter(CONSTANT_RE.findall(base_text))
+    actual = {name for name in definitions if name in expected}
     expected_fingerprint = constants_fingerprint(expected)
     actual_fingerprint = constants_fingerprint(actual)
-    if actual != expected:
-        missing = sorted(expected - actual)
-        extra = sorted(actual - expected)
+    missing = sorted(expected - actual)
+    duplicates = sorted(name for name in expected if definitions[name] > 1)
+    if missing or duplicates:
         raise ValueError(
-            "AiBuilder 参数集合/版本不匹配 (expected=%s actual=%s missing=%d extra=%d)"
-            % (expected_fingerprint[:12], actual_fingerprint[:12], len(missing), len(extra))
+            "AiBuilder 目标参数缺失或重复 (expected=%s actual=%s missing=%d duplicate=%d)"
+            % (expected_fingerprint[:12], actual_fingerprint[:12], len(missing), len(duplicates))
         )
     if set(gene) != expected:
         raise ValueError("基因常量集合不完整：expected=%d actual=%d" % (len(expected), len(gene)))

@@ -68,17 +68,19 @@ class AiBuilderCoverageTests(unittest.TestCase):
 
     def test_missing_constant_fails_fast(self):
         template = builder_template().replace("(defconst phase1-food-gatherers 0)\n", "")
-        with self.assertRaisesRegex(ValueError, "参数集合/版本不匹配"):
+        with self.assertRaisesRegex(ValueError, "目标参数缺失或重复"):
             MK.build_per_text(template, G.default_genome(), "Missing")
 
-    def test_unexpected_constant_fails_as_version_mismatch(self):
-        template = builder_template() + "\n(defconst phase1-new-parameter 1)"
-        with self.assertRaisesRegex(ValueError, "参数集合/版本不匹配"):
-            MK.build_per_text(template, G.default_genome(), "VersionMismatch")
+    def test_unrelated_official_constants_are_ignored(self):
+        extras = "\n".join("(defconst official-extra-%d 1)" % i for i in range(865))
+        template = builder_template() + "\n" + extras
+        result = MK.build_per_text(template, G.default_genome(), "OfficialExtras")
+        for name, value in G.default_genome().items():
+            self.assertIn("(defconst %s %d)" % (name, value), result)
 
     def test_duplicate_definition_fails(self):
         template = builder_template() + "\n(defconst phase1-food-gatherers 1)"
-        with self.assertRaisesRegex(ValueError, "必须且只能定义一次"):
+        with self.assertRaisesRegex(ValueError, "目标参数缺失或重复"):
             MK.build_per_text(template, G.default_genome(), "Duplicate")
 
     def test_install_mismatch_writes_no_generated_files(self):
@@ -86,7 +88,7 @@ class AiBuilderCoverageTests(unittest.TestCase):
             ai_dir = Path(tmp)
             (ai_dir / "base.per").write_text("(defconst phase1-food-gatherers 0)", encoding="latin-1")
             config = {"game": {"ai_dir": str(ai_dir), "base_script": "base.per"}}
-            with self.assertRaisesRegex(ValueError, "参数集合/版本不匹配"):
+            with self.assertRaisesRegex(ValueError, "目标参数缺失或重复"):
                 MK.install("Rejected", G.default_genome(), config)
             self.assertFalse((ai_dir / "EvoAI_Rejected.per").exists())
             self.assertFalse((ai_dir / "EvoAI_Rejected.ai").exists())

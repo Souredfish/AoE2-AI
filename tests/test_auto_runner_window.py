@@ -10,9 +10,11 @@ from ai_lab import auto_runner
 class WindowReadinessTests(unittest.TestCase):
     GAME_EXE = r"C:\Steam\steamapps\common\AoE2DE\AoE2DE_s.exe"
 
-    def _window(self, hwnd=1, visible=True, minimized=False, width=1382, height=807):
+    def _window(self, hwnd=1, pid=20, visible=True, minimized=False,
+                width=1382, height=807):
         return {
             "hwnd": hwnd,
+            "pid": pid,
             "title": "Age of Empires II: Definitive Edition",
             "class": auto_runner.GAME_MAIN_WINDOW_CLASS,
             "visible": visible, "minimized": minimized,
@@ -47,14 +49,11 @@ class WindowReadinessTests(unittest.TestCase):
 
     def test_game_window_gate_rejects_unready_or_ambiguous_main_window(self):
         cases = [
-            ([self._window(visible=False)], "不可见"),
+            ([self._window(visible=False)], "同类游戏窗口均隐藏"),
             ([self._window(minimized=True, width=160, height=28)], "最小化"),
-            ([self._window(width=500, height=300)], "尺寸小于"),
-            ([self._window(visible=False), self._window(hwnd=2)], "识别不唯一"),
-            ([self._window(minimized=True, width=160, height=28),
-              self._window(hwnd=2)], "识别不唯一"),
+            ([self._window(width=500, height=300)], "尺寸未达到"),
             ([self._window(), {**self._window(hwnd=2), "title": "Second game window"}],
-             "识别不唯一"),
+             "真正就绪的游戏主窗口不唯一"),
         ]
         for windows, expected_reason in cases:
             with self.subTest(windows=windows):
@@ -66,6 +65,28 @@ class WindowReadinessTests(unittest.TestCase):
         ready, reason = auto_runner.evaluate_game_windows([self._window()])
         self.assertTrue(ready)
         self.assertIn("hwnd=0x1", reason)
+
+    def test_startup_splash_alone_cannot_pass_ready_gate(self):
+        ready, reason = auto_runner.evaluate_game_windows([
+            self._window(hwnd=2, width=640, height=480)])
+        self.assertFalse(ready)
+        self.assertIn("仅检测到启动 splash", reason)
+
+    def test_main_window_with_splash_and_hidden_window_passes(self):
+        main = self._window(hwnd=1, pid=20, width=1920, height=1080)
+        splash = self._window(hwnd=2, pid=20, width=640, height=480)
+        hidden = self._window(hwnd=3, pid=20, visible=False, width=1382, height=807)
+        ready, reason = auto_runner.evaluate_game_windows([splash, hidden, main])
+        self.assertTrue(ready)
+        self.assertIn("pid=20 hwnd=0x1", reason)
+        self.assertIn("忽略 2 个非就绪同类窗", reason)
+
+    def test_hidden_and_minimized_windows_do_not_create_ambiguity(self):
+        windows = [self._window(hwnd=1),
+                   self._window(hwnd=2, visible=False),
+                   self._window(hwnd=3, minimized=True)]
+        ready, _ = auto_runner.evaluate_game_windows(windows)
+        self.assertTrue(ready)
 
     def _wait(self, states, timeout=4):
         now = [0.0]

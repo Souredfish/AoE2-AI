@@ -184,8 +184,10 @@ def steam_launched_game_pids(processes, game_exe):
     return result
 
 
-WINDOW_MIN_WIDTH = 640
-WINDOW_MIN_HEIGHT = 360
+WINDOW_MIN_WIDTH = 641
+WINDOW_MIN_HEIGHT = 481
+WINDOW_SPLASH_MAX_WIDTH = 640
+WINDOW_SPLASH_MAX_HEIGHT = 480
 GAME_MAIN_WINDOW_CLASS = "Age of Empires II: Definitive Edition"
 CONTROL_SUCCESS_STATUSES = {
     "Ready",
@@ -196,31 +198,43 @@ CONTROL_SUCCESS_STATUSES = {
 
 
 def evaluate_game_windows(windows):
-    """Ignore unrelated top-level windows, fail closed on ambiguous game mains."""
-    candidates = [window for window in windows
-                  if window.get("class") == GAME_MAIN_WINDOW_CLASS]
-    if not candidates:
+    """Accept one visible full-size game main, excluding hidden windows and splash."""
+    class_windows = [window for window in windows
+                     if window.get("class") == GAME_MAIN_WINDOW_CLASS]
+    if not class_windows:
         return False, "未找到游戏主窗口类 %r（枚举到 %d 个标题窗口）" % (
             GAME_MAIN_WINDOW_CLASS, len(windows))
-    if len(candidates) != 1:
-        details = "; ".join(
-            "hwnd=0x%x visible=%s minimized=%s size=%dx%d title=%r class=%r" %
-            (w["hwnd"], w["visible"], w["minimized"], w["width"], w["height"],
-             w["title"], w["class"])
-            for w in candidates)
-        return False, "游戏主窗口识别不唯一（%d 个候选：%s）" % (
-            len(candidates), details)
-    window = candidates[0]
-    detail = "hwnd=0x%x visible=%s minimized=%s size=%dx%d title=%r class=%r" % (
-        window["hwnd"], window["visible"], window["minimized"],
-        window["width"], window["height"], window["title"], window["class"])
-    if not window["visible"]:
-        return False, "游戏主窗口不可见（%s）" % detail
-    if window["minimized"]:
-        return False, "游戏主窗口已最小化（%s）" % detail
-    if window["width"] < WINDOW_MIN_WIDTH or window["height"] < WINDOW_MIN_HEIGHT:
-        return False, "游戏主窗口尺寸小于 640×360（%s）" % detail
-    return True, "游戏主窗口就绪（%s）" % detail
+    visible = [window for window in class_windows if window.get("visible")]
+    restored = [window for window in visible if not window.get("minimized")]
+    ready = [window for window in restored
+             if window.get("width", 0) >= WINDOW_MIN_WIDTH
+             and window.get("height", 0) >= WINDOW_MIN_HEIGHT]
+
+    def details(items):
+        return "; ".join(
+            "pid=%s hwnd=0x%x visible=%s minimized=%s size=%dx%d title=%r class=%r" %
+            (w.get("pid", "?"), w["hwnd"], w.get("visible"), w.get("minimized"),
+             w.get("width", 0), w.get("height", 0), w.get("title", ""),
+             w.get("class", ""))
+            for w in items)
+
+    if len(ready) > 1:
+        return False, "真正就绪的游戏主窗口不唯一（%d 个：%s）" % (
+            len(ready), details(ready))
+    if len(ready) == 1:
+        return True, "游戏主窗口就绪（%s；忽略 %d 个非就绪同类窗）" % (
+            details(ready), len(class_windows) - 1)
+    if not visible:
+        return False, "同类游戏窗口均隐藏（%s）" % details(class_windows)
+    if not restored:
+        return False, "同类游戏窗口均已最小化（%s）" % details(visible)
+    splash = [window for window in restored
+              if window.get("width", 0) == WINDOW_SPLASH_MAX_WIDTH
+              and window.get("height", 0) == WINDOW_SPLASH_MAX_HEIGHT]
+    if splash and len(splash) == len(restored):
+        return False, "仅检测到启动 splash，游戏主窗口尚未就绪（%s）" % details(splash)
+    return False, "游戏主窗口尺寸未达到 %dx%d（%s）" % (
+        WINDOW_MIN_WIDTH, WINDOW_MIN_HEIGHT, details(restored))
 
 
 def control_terminal_status(stdout):
@@ -264,7 +278,8 @@ def game_window_status(game_pids=None):
                 user32.GetClassNameW(hwnd, class_name, len(class_name))
                 if title.value and user32.GetWindowRect(hwnd, ctypes.byref(rect)):
                     windows.append({
-                        "hwnd": int(hwnd), "title": title.value, "class": class_name.value,
+                        "hwnd": int(hwnd), "pid": int(pid.value),
+                        "title": title.value, "class": class_name.value,
                         "visible": bool(user32.IsWindowVisible(hwnd)),
                         "minimized": bool(user32.IsIconic(hwnd)),
                         "width": rect.right - rect.left, "height": rect.bottom - rect.top,

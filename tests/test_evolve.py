@@ -1,6 +1,9 @@
 import unittest
+import json
+import tempfile
+from pathlib import Path
 
-from ai_lab.evolve import _should_update_champion, _tournament
+from ai_lab.evolve import _load_champion_fitness, _should_update_champion, _tournament
 
 
 class SequenceRng:
@@ -34,6 +37,21 @@ class ChampionTests(unittest.TestCase):
 
     def test_legacy_champion_without_score_is_preserved(self):
         self.assertFalse(_should_update_champion(10.0, None, True))
+
+    def test_non_finite_stored_fitness_is_treated_as_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            score_file = Path(tmp) / "champion_fitness.json"
+            for value in (float("nan"), float("inf"), float("-inf")):
+                score_file.write_text(json.dumps({"fitness": value}), encoding="utf-8")
+                self.assertIsNone(_load_champion_fitness(score_file))
+
+    def test_non_finite_candidate_does_not_replace_existing_champion(self):
+        for value in (float("nan"), float("inf"), float("-inf")):
+            self.assertFalse(_should_update_champion(value, 1.0, True))
+
+    def test_non_finite_candidate_does_not_create_first_champion(self):
+        for value in (float("nan"), float("inf"), float("-inf")):
+            self.assertFalse(_should_update_champion(value, None, False))
 
 
 if __name__ == "__main__":

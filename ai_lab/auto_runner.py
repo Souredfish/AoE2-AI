@@ -22,6 +22,8 @@ auto_runner.py — 全自动跑局（AoE2Control 驱动）
 """
 
 import argparse
+import csv
+import io
 import json
 import math
 import random
@@ -98,7 +100,76 @@ def start_game(cfg):
     subprocess.Popen([str(exe)], cwd=str(exe.parent))
 
 
-def ensure_control(cfg, max_wait_s=600):
+WINDOW_MIN_WIDTH = 640
+WINDOW_MIN_HEIGHT = 360
+
+
+def game_window_status():
+    """Return (ready, reason) for a visible, restored AoE2 game window."""
+    if sys.platform != "win32":
+        return False, "窗口状态探测仅支持 Windows"
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        out = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq AoE2DE_s.exe", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=15)
+        pids = set()
+        for row in csv.reader(io.StringIO(out.stdout or "")):
+            if len(row) >= 2 and row[0].lower() == "aoe2de_s.exe":
+                try:
+                    pids.add(int(row[1]))
+                except ValueError:
+                    pass
+        if not pids:
+            return False, "未找到 AoE2DE_s.exe 进程"
+
+        user32 = ctypes.windll.user32
+        found = []
+        callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        @callback_type
+        def visit(hwnd, _):
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value in pids and user32.IsWindowVisible(hwnd):
+                rect = wintypes.RECT()
+                if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                    minimized = bool(user32.IsIconic(hwnd))
+                    width, height = rect.right - rect.left, rect.bottom - rect.top
+                    found.append((minimized, width, height))
+            return True
+
+        user32.EnumWindows(visit, 0)
+        if not found:
+            return False, "游戏窗口不存在或不可见"
+        if not any(not minimized for minimized, _, _ in found):
+            return False, "游戏窗口已最小化"
+        if not any(not minimized and width >= WINDOW_MIN_WIDTH and height >= WINDOW_MIN_HEIGHT
+                   for minimized, width, height in found):
+            return False, "游戏窗口尺寸小于 640×360"
+        return True, "窗口可见、未最小化且尺寸满足要求"
+    except Exception as exc:
+        return False, "窗口探测失败: %s" % exc
+
+
+def wait_for_game_window(timeout_s, window_probe=game_window_status,
+                         poll_interval_s=2, monotonic=time.monotonic, sleep=time.sleep):
+    deadline = monotonic() + timeout_s
+    last_reason = "尚未探测"
+    while True:
+        ready, last_reason = window_probe()
+        if ready:
+            return True, last_reason
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return False, "等待游戏窗口就绪超时（%s）" % last_reason
+        sleep(min(poll_interval_s, remaining))
+
+
+def ensure_control(cfg, max_wait_s=600, window_probe=game_window_status,
+                   control_runner=subprocess.run, monotonic=time.monotonic, sleep=time.sleep):
     """确保游戏运行且 CONTROL 就绪。返回 True/False。"""
     launcher = Path(cfg["control"]["launcher"])
     if not launcher.is_absolute():
@@ -112,12 +183,17 @@ def ensure_control(cfg, max_wait_s=600):
         start_game(cfg)
         print("[等待] 游戏启动中（首次启动可能需要 1~2 分钟）...")
 
-    deadline = time.time() + max_wait_s
-    while time.time() < deadline:
+    deadline = monotonic() + max_wait_s
+    last_window_reason = "未检测"
+    while monotonic() < deadline:
         if not game_running():
-            time.sleep(10)
+            sleep(min(10, max(0, deadline - monotonic())))
             continue
-        proc = subprocess.run(
+        ready, last_window_reason = window_probe()
+        if not ready:
+            sleep(min(2, max(0, deadline - monotonic())))
+            continue
+        proc = control_runner(
             [str(launcher), "--headless", "--timeout-ms", "120000"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=180)
@@ -127,11 +203,13 @@ def ensure_control(cfg, max_wait_s=600):
         if proc.returncode == 0:
             return True
         if proc.returncode in (6, 7):
-            time.sleep(15)  # 游戏还没起来/窗口未就绪，继续等
+            last_window_reason = "Headless exit %d: %s" % (
+                proc.returncode, last[-1] if last else "无输出")
+            sleep(min(2, max(0, deadline - monotonic())))
             continue
         print("[错误] CONTROL 启动失败，输出：\n%s" % out)
         return False
-    print("[错误] 等待游戏/CONTROL 超时")
+    print("[错误] 等待游戏窗口/CONTROL 超时（窗口状态：%s）" % last_window_reason)
     return False
 
 

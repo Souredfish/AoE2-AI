@@ -120,7 +120,8 @@ def cmd_report(args, cfg):
     gen_file = LAB / "generations" / ("gen_%d.json" % cur)
     pop = len(json.loads(gen_file.read_text(encoding="utf-8")))
     pairs = make_schedule(pop, int(ec.get("matches_per_ai", 3)), random.Random(cur * 7919))
-    manifest = ER.load_schedule(LAB, cur, pairs)
+    expected_count = pop * int(ec.get("matches_per_ai", 3)) // 2
+    manifest = ER.load_schedule(LAB, cur, pairs, results, pop, expected_count)
     accepted = ER.reconcile_results(results, manifest)
     record = info.get("file")
     canonical_record = str(Path(record).resolve()) if record else None
@@ -192,8 +193,8 @@ def cmd_next(args, cfg):
     gene_pop = json.loads(gen_file.read_text(encoding="utf-8"))
     results = json.loads(res_file.read_text(encoding="utf-8"))
     pairs = make_schedule(len(gene_pop), int(ec.get("matches_per_ai", 3)), random.Random(cur * 7919))
-    manifest = ER.load_schedule(LAB, cur, pairs)
     expected_count = len(gene_pop) * int(ec.get("matches_per_ai", 3)) // 2
+    manifest = ER.load_schedule(LAB, cur, pairs, results, len(gene_pop), expected_count)
     try:
         accepted = ER.validate_complete(results, manifest, len(gene_pop), expected_count)
     except ValueError as e:

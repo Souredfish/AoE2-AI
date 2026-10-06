@@ -40,7 +40,7 @@ def save_schedule(lab, gen, pairs):
     return manifest
 
 
-def load_schedule(lab, gen, pairs=None):
+def load_schedule(lab, gen, pairs=None, legacy_results=None, population=None, expected_matches=None):
     path = schedule_path(lab, gen)
     if path.exists():
         manifest = json.loads(path.read_text(encoding="utf-8"))
@@ -49,6 +49,30 @@ def load_schedule(lab, gen, pairs=None):
         return manifest
     if pairs is None:
         raise ValueError("第 %d 代没有赛程清单，需用确定性旧格式兼容赛程恢复" % gen)
+    # Older manual reports did not persist their randomized schedule. Preserve
+    # every unambiguous completed pair, then fill the remaining slots from the
+    # deterministic auto_runner schedule so recovery never shifts old results.
+    migrated_pairs = []
+    for row in legacy_results or []:
+        names = _result_names(row)
+        ids = [individual_from_name(name, gen, population) for name in names]
+        if None in ids or ids[0] == ids[1]:
+            raise ValueError("旧格式结果无法映射到第 %d 代个体" % gen)
+        pair = tuple(ids)
+        if frozenset(pair) in {frozenset(p) for p in migrated_pairs}:
+            raise ValueError("旧格式账本重复记录参赛组合: %s" % (names,))
+        migrated_pairs.append(pair)
+    target_count = expected_matches if expected_matches is not None else len(pairs)
+    if len(migrated_pairs) > target_count:
+        raise ValueError("旧格式结果场数超过计划赛程，无法安全迁移")
+    known = {frozenset(pair) for pair in migrated_pairs}
+    for pair in pairs:
+        if frozenset(pair) not in known and len(migrated_pairs) < target_count:
+            migrated_pairs.append(pair)
+            known.add(frozenset(pair))
+    if len(migrated_pairs) != target_count:
+        raise ValueError("无法从旧账本与兼容赛程重建完整计划")
+    pairs = migrated_pairs
     return save_schedule(lab, gen, pairs)
 
 
@@ -130,6 +154,8 @@ def validate_schedule(manifest, population, expected_matches):
     if len(manifest["matches"]) != expected_matches:
         raise ValueError("计划场数错误：预期 %d，赛程实际 %d" % (expected_matches, len(manifest["matches"])))
     participants = {name for match in manifest["matches"] for name in _match_names(match)}
+    if len({frozenset(_match_names(match)) for match in manifest["matches"]}) != len(manifest["matches"]):
+        raise ValueError("赛程包含重复参赛组合")
     expected_participants = {individual_name(manifest["generation"], i) for i in range(population)}
     if participants != expected_participants:
         raise ValueError("赛程参赛个体覆盖不完整")

@@ -4,7 +4,7 @@ import tempfile
 from pathlib import Path
 
 from ai_lab.evolve import _load_champion_fitness, _should_update_champion, _tournament
-from ai_lab.evo_results import build_schedule, match_id_for_recording, pending_matches, reconcile_results, validate_complete
+from ai_lab.evo_results import build_schedule, load_schedule, match_id_for_recording, pending_matches, reconcile_results, validate_complete
 
 
 class SequenceRng:
@@ -120,6 +120,14 @@ class ResultLedgerTests(unittest.TestCase):
             original.write_bytes(b"sample recording bytes")
             copied.write_bytes(original.read_bytes())
             self.assertEqual(match_id_for_recording(original), match_id_for_recording(copied))
+
+    def test_legacy_schedule_migration_preserves_completed_pairings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            legacy = [{"players": [["EvoAI_G4P1", True], ["EvoAI_G4P3", False]],
+                       "winners": ["EvoAI_G4P1"], "record": "old-record.aoe2record"}]
+            manifest = load_schedule(tmp, 4, [(0, 1), (0, 2), (1, 2)], legacy, 4, 3)
+            self.assertEqual(manifest["matches"][0]["players"], ["EvoAI_G4P1", "EvoAI_G4P3"])
+            self.assertEqual(len(manifest["matches"]), 3)
 
 
 if __name__ == "__main__":

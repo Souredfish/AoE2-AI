@@ -202,17 +202,17 @@ def main():
     pop = len(gene_pop)
     ec = EV.evo_cfg(cfg)
     pairs = EV.make_schedule(pop, int(ec.get("matches_per_ai", 3)), random.Random(gen * 7919))
-    manifest = EV.ER.load_schedule(LAB, gen, pairs)
     expected_count = pop * int(ec.get("matches_per_ai", 3)) // 2
+    res_dir = LAB / "results"
+    res_dir.mkdir(parents=True, exist_ok=True)
+    res_file = res_dir / ("gen_%d.json" % gen)
+    results = json.loads(res_file.read_text(encoding="utf-8")) if res_file.exists() else []
+    manifest = EV.ER.load_schedule(LAB, gen, pairs, results, pop, expected_count)
     try:
         EV.ER.validate_schedule(manifest, pop, expected_count)
     except ValueError as e:
         sys.exit("[拒绝] 赛程本身不完整或覆盖不足：%s" % e)
 
-    res_dir = LAB / "results"
-    res_dir.mkdir(parents=True, exist_ok=True)
-    res_file = res_dir / ("gen_%d.json" % gen)
-    results = json.loads(res_file.read_text(encoding="utf-8")) if res_file.exists() else []
     try:
         accepted = EV.ER.reconcile_results(results, manifest)
     except ValueError as e:

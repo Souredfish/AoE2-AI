@@ -201,19 +201,30 @@ def main():
     gene_pop = json.loads(gen_file.read_text(encoding="utf-8"))
     pop = len(gene_pop)
     ec = EV.evo_cfg(cfg)
-    rng = random.Random(gen * 7919)
-    schedule = EV.make_schedule(pop, int(ec.get("matches_per_ai", 3)), rng)
-    if args.matches:
-        schedule = schedule[: args.matches]
+    pairs = EV.make_schedule(pop, int(ec.get("matches_per_ai", 3)), random.Random(gen * 7919))
+    manifest = EV.ER.load_schedule(LAB, gen, pairs)
+    expected_count = pop * int(ec.get("matches_per_ai", 3)) // 2
+    try:
+        EV.ER.validate_schedule(manifest, pop, expected_count)
+    except ValueError as e:
+        sys.exit("[拒绝] 赛程本身不完整或覆盖不足：%s" % e)
 
     res_dir = LAB / "results"
     res_dir.mkdir(parents=True, exist_ok=True)
     res_file = res_dir / ("gen_%d.json" % gen)
     results = json.loads(res_file.read_text(encoding="utf-8")) if res_file.exists() else []
-    done = len(results)
-    schedule = schedule[done:]
-    print("[赛程] 第 %d 代共需 %d 场，已完成 %d 场，本次跑 %d 场"
-          % (gen, done + len(schedule), done, len(schedule)))
+    try:
+        accepted = EV.ER.reconcile_results(results, manifest)
+    except ValueError as e:
+        sys.exit("[拒绝] 现有结果账本无效，未启动对局：%s" % e)
+    # Persist assigned IDs for legacy ledger rows before resuming.
+    EV.ER.write_results(res_file, results)
+    done = len(accepted)
+    schedule = EV.ER.pending_matches(results, manifest)
+    if args.matches is not None:
+        schedule = schedule[:max(0, args.matches)]
+    print("[赛程] 第 %d 代计划 %d 场，已完成 %d 场，本次跑 %d 场"
+          % (gen, len(manifest["matches"]), done, len(schedule)))
     if not schedule:
         print("[完成] 本代赛程已全部跑完，直接执行 evolve.py next 即可")
         return
@@ -242,9 +253,12 @@ def main():
     print()
 
     timeout_min = int(cfg.get("control", {}).get("auto_match_timeout_min", 150))
-    for idx, (a, b) in enumerate(schedule):
+    for idx, match in enumerate(schedule):
+        a, b = [EV.ER.individual_from_name(n, gen, pop) for n in match["players"]]
+        if a is None or b is None:
+            sys.exit("[拒绝] 赛程参赛名无效: %s" % match)
         print("[对局 %d/%d] EvoAI_G%dP%d  vs  EvoAI_G%dP%d"
-              % (done + idx + 1, done + len(schedule), gen, a, gen, b))
+              % (done + idx + 1, len(manifest["matches"]), gen, a, gen, b))
         # 换上本局的两个基因
         MK.install("A", {k: v for k, v in gene_pop[a].items()}, cfg)
         MK.install("B", {k: v for k, v in gene_pop[b].items()}, cfg)
@@ -274,14 +288,25 @@ def main():
                 scores[na] = p.get("score")
             elif i == 2:
                 scores[nb] = p.get("score")
+        if winner_name not in (na, nb):
+            print("[拒绝] 未能唯一判定本局胜者；录像保留，账本不推进。修正胜者后重新运行。")
+            break
         results.append({
+            "match_id": match["match_id"],
             "players": [[na, winner_name == na], [nb, winner_name == nb]],
             "winners": [winner_name] if winner_name else [],
             "scores": scores,
             "duration_min": info.get("duration_min"),
-            "record": str(rec),
+            "record": str(rec.resolve()),
+            "record_id": EV.ER.match_id_for_recording(rec),
         })
-        res_file.write_text(json.dumps(results, indent=1, ensure_ascii=False), encoding="utf-8")
+        try:
+            EV.ER.reconcile_results(results, manifest)
+        except ValueError as e:
+            results.pop()
+            print("[拒绝] 对局结果未写入账本：%s" % e)
+            break
+        EV.ER.write_results(res_file, results)
         if winner_name:
             print("[结果] 胜者: %s" % winner_name)
         else:

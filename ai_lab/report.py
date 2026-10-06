@@ -66,11 +66,16 @@ def parse_record(path):
     try:
         for p in s.get_players():
             entry = {
+                # mgz exposes this as player_number/number; do not infer a
+                # slot from list order when empty AI names require slot mapping.
+                "slot": p.get("number"),
                 "name": p.get("name", "?"),
                 "civ": p.get("civilization", "?"),
                 "color": p.get("color_id"),
                 "human": p.get("human"),
             }
+            if "user_id" in p:
+                entry["user_id"] = p["user_id"]
             # mgz 的 winner 字段（来自 postgame）不一定存在
             if "winner" in p and p["winner"] is not None:
                 entry["winner"] = bool(p["winner"])

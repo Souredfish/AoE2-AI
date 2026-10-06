@@ -10,6 +10,7 @@ venv/
 lab_data/generated/
 lab_data/results/
 lab_data/reports/
+lab_data/runner_evidence/
 
 # 第三方二进制（不进 git，按 README 提示下载）
 tools/AoE2Control/*.exe

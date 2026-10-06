@@ -22,9 +22,12 @@ auto_runner.py — 全自动跑局（AoE2Control 驱动）
 """
 
 import argparse
+import hashlib
 import json
 import math
+import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -42,6 +45,8 @@ import recordings as REC  # noqa: E402
 LAB = ROOT / "lab_data"
 CONTROL_CFG = Path.home().parent.parent / "AppData/Roaming"  # %APPDATA%
 APPDATA = Path.home().drive and Path(str(Path.home()).split("Users")[0] + "Users")  # unused fallback
+AI_PLAYER_SLOT_BY_ALIAS = {"A": 2, "B": 3}
+AI_USER_ID = 0xFFFFFFFF
 
 
 def appdata():
@@ -146,14 +151,44 @@ def list_recordings(cfg):
 def wait_new_recording(cfg, before, timeout_min):
     deadline = time.time() + timeout_min * 60
     while time.time() < deadline:
-        now = list_recordings(cfg)
-        new = [p for k, p in now.items() if k not in before]
-        if new:
-            newest = max(new, key=lambda p: p.stat().st_mtime)
-            time.sleep(3)  # 等文件写完
-            return newest
+        now = recording_snapshot(cfg)
+        new_keys = unique_new_recording_paths(before, now)
+        if len(new_keys) > 1:
+            raise ValueError("本局录像关联不唯一：快照后出现多个新录像")
+        if new_keys:
+            key = new_keys[0]
+            first_stat = now[key]
+            time.sleep(3)  # 等游戏完成录像写入
+            settled = recording_snapshot(cfg)
+            settled_keys = unique_new_recording_paths(before, settled)
+            if settled_keys != [key]:
+                if len(settled_keys) > 1:
+                    raise ValueError("本局录像关联不唯一：快照后出现多个新录像")
+                continue
+            if settled[key] == first_stat:
+                return list_recordings(cfg)[key]
         time.sleep(5)
     return None
+
+
+def recording_snapshot(cfg):
+    """Capture stable file signatures before a match can create its replay."""
+    snapshot = {}
+    for key, path in list_recordings(cfg).items():
+        try:
+            stat = path.stat()
+        except OSError:
+            continue
+        snapshot[key] = {"size_bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+    return snapshot
+
+
+def unique_new_recording_paths(before, after):
+    """Return new recording paths, rejecting an ambiguous match association."""
+    new_paths = sorted(set(after) - set(before))
+    if len(new_paths) > 1:
+        raise ValueError("录像关联不唯一：快照后出现多个新录像")
+    return new_paths
 
 
 def _players_by_identity(info):
@@ -171,6 +206,97 @@ def _players_by_identity(info):
     return players_by_identity
 
 
+def _file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _players_by_scheduled_slot(info, evidence):
+    slots_by_alias = evidence.get("slots_by_alias")
+    if slots_by_alias != AI_PLAYER_SLOT_BY_ALIAS:
+        raise ValueError("录像槽位映射与已配置 A/B 槽位不符")
+    players_by_slot = {}
+    for player in info.get("players", []):
+        if not isinstance(player, dict):
+            raise ValueError("录像玩家槽位数据格式无效")
+        slot = player.get("slot")
+        if not isinstance(slot, int) or isinstance(slot, bool) or slot in players_by_slot:
+            raise ValueError("录像玩家槽位缺失或重复，无法唯一映射")
+        players_by_slot[slot] = player
+    if set(players_by_slot) != {1, 2, 3}:
+        raise ValueError("录像必须包含唯一的观察者槽位 1 和 AI 槽位 2/3")
+    if players_by_slot[1].get("user_id") == AI_USER_ID:
+        raise ValueError("录像槽位 1 未能确认是观察者")
+
+    result = {}
+    for alias, slot in slots_by_alias.items():
+        player = players_by_slot[slot]
+        if player.get("user_id") != AI_USER_ID:
+            raise ValueError("录像槽位 %d 未能确认为 AI 玩家" % slot)
+        player_name = str(player.get("name", "")).strip()
+        expected_name = "EvoAI_" + alias
+        if player_name and expected_name not in player_name:
+            raise ValueError("录像名字与槽位映射冲突：槽位 %d" % slot)
+        result["EvoAI_" + alias] = player
+    return result
+
+
+def validate_match_evidence(info, gen, a, b, match, record, record_id, evidence):
+    """Require a unique, auditable schedule/slot/install/replay association."""
+    if not isinstance(evidence, dict) or evidence.get("schema_version") != 1:
+        raise ValueError("缺少本局录像关联证据")
+    if evidence.get("match_id") != match.get("match_id"):
+        raise ValueError("录像关联证据的 match_id 与赛程不符")
+    installed = evidence.get("installed")
+    expected = {"A": "EvoAI_G%dP%d" % (gen, a), "B": "EvoAI_G%dP%d" % (gen, b)}
+    if not isinstance(installed, dict) or set(installed) != {"A", "B"}:
+        raise ValueError("缺少 A/B 已安装基因证据")
+    installed_paths = set()
+    for alias, genome in expected.items():
+        item = installed[alias]
+        if not isinstance(item, dict) or item.get("genome") != genome:
+            raise ValueError("已安装 %s 基因身份与赛程不符" % alias)
+        if not re.fullmatch(r"[0-9a-f]{64}", str(item.get("per_sha256", ""))):
+            raise ValueError("已安装 %s .per SHA-256 缺失或无效" % alias)
+        per_path = str(item.get("per_path", ""))
+        if Path(per_path).name != "EvoAI_%s.per" % alias:
+            raise ValueError("已安装 %s .per 路径缺失" % alias)
+        path_key = os.path.normcase(os.path.abspath(per_path))
+        if path_key in installed_paths:
+            raise ValueError("A/B 已安装 .per 路径不唯一")
+        installed_paths.add(path_key)
+
+    baseline = evidence.get("recording_baseline")
+    recording = evidence.get("recording")
+    captured_at = evidence.get("baseline_captured_at_ns")
+    if (not isinstance(baseline, dict) or not isinstance(recording, dict)
+            or not isinstance(captured_at, int) or isinstance(captured_at, bool)
+            or captured_at <= 0):
+        raise ValueError("录像发现前后快照证据不完整")
+    record_path = str(Path(record).expanduser().resolve())
+    record_key = os.path.normcase(os.path.abspath(record_path))
+    new_candidates = recording.get("new_candidates")
+    if not isinstance(new_candidates, list):
+        raise ValueError("录像新增候选列表缺失")
+    candidate_keys = [os.path.normcase(os.path.abspath(str(path)))
+                      for path in new_candidates]
+    if (record_key in baseline or recording.get("new_since_snapshot") is not True
+            or candidate_keys != [record_key]):
+        raise ValueError("录像未能证明是本局快照后唯一新增文件")
+    stat = Path(record_path).stat()
+    if (recording.get("path") != record_path
+            or recording.get("record_id") != record_id
+            or recording.get("size_bytes") != stat.st_size
+            or recording.get("mtime_ns") != stat.st_mtime_ns
+            or stat.st_size <= 0
+            or record_id != EV.ER.match_id_for_recording(record_path)):
+        raise ValueError("录像路径、指纹或文件状态与关联证据不符")
+    return _players_by_scheduled_slot(info, evidence)
+
+
 def _valid_score(value):
     return value is None or (
         isinstance(value, (int, float)) and not isinstance(value, bool)
@@ -178,13 +304,14 @@ def _valid_score(value):
     )
 
 
-def resolve_winner(info, gen, a, b):
+def resolve_winner(info, gen, a, b, players_by_identity=None):
     """Map one unambiguous replay winner to its installed genome identity."""
     identity_to_genome = {
         "EvoAI_A": "EvoAI_G%dP%d" % (gen, a),
         "EvoAI_B": "EvoAI_G%dP%d" % (gen, b),
     }
-    players_by_identity = _players_by_identity(info)
+    if players_by_identity is None:
+        players_by_identity = _players_by_identity(info)
     if players_by_identity is None:
         return None
 
@@ -207,16 +334,20 @@ def resolve_winner(info, gen, a, b):
     return None
 
 
-def match_result_from_replay(info, gen, a, b, match, record, record_id):
+def match_result_from_replay(info, gen, a, b, match, record, record_id, evidence=None):
     """Build one ledger row, rejecting ambiguous winners and invalid scores."""
     na, nb = "EvoAI_G%dP%d" % (gen, a), "EvoAI_G%dP%d" % (gen, b)
-    players_by_identity = _players_by_identity(info)
+    if evidence is None:
+        players_by_identity = _players_by_identity(info)
+    else:
+        players_by_identity = validate_match_evidence(
+            info, gen, a, b, match, record, record_id, evidence)
     if players_by_identity is None:
         raise ValueError("录像未能唯一映射到 EvoAI_A 与 EvoAI_B")
     if any(not _valid_score(player.get("score"))
            for player in players_by_identity.values()):
         raise ValueError("录像比分必须是有限数值或缺失")
-    winner_name = resolve_winner(info, gen, a, b)
+    winner_name = resolve_winner(info, gen, a, b, players_by_identity)
     if winner_name not in (na, nb):
         raise ValueError("录像胜者无效、多个胜者或无法唯一判定")
     scores = {
@@ -231,7 +362,16 @@ def match_result_from_replay(info, gen, a, b, match, record, record_id):
         "duration_min": info.get("duration_min"),
         "record": str(record),
         "record_id": record_id,
+        **({"association": evidence} if evidence is not None else {}),
     }
+
+
+def append_runner_evidence(gen, event):
+    """Append audit events outside source control, retaining retries by match."""
+    path = LAB / "runner_evidence" / ("gen_%d.jsonl" % gen)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
 
 
 # ------------------------------------------------------------------
@@ -312,18 +452,82 @@ def main():
             sys.exit("[拒绝] 赛程参赛名无效: %s" % match)
         print("[对局 %d/%d] EvoAI_G%dP%d  vs  EvoAI_G%dP%d"
               % (done + idx + 1, len(manifest["matches"]), gen, a, gen, b))
-        # 换上本局的两个基因
+        # Capture exactly what existed before this match, then record installed
+        # identities before waiting for a replay to appear.
+        baseline_captured_at_ns = time.time_ns()
+        before = recording_snapshot(cfg)
         MK.install("A", {k: v for k, v in gene_pop[a].items()}, cfg)
         MK.install("B", {k: v for k, v in gene_pop[b].items()}, cfg)
+        ai_dir = Path(cfg["game"]["ai_dir"])
+        installed = {}
+        for alias, individual in (("A", a), ("B", b)):
+            per_path = (ai_dir / ("EvoAI_%s.per" % alias)).resolve()
+            installed[alias] = {
+                "genome": "EvoAI_G%dP%d" % (gen, individual),
+                "per_path": str(per_path),
+                "per_sha256": _file_sha256(per_path),
+            }
+        evidence = {
+            "schema_version": 1,
+            "match_id": match["match_id"],
+            "slots_by_alias": dict(AI_PLAYER_SLOT_BY_ALIAS),
+            "installed": installed,
+            "recording_baseline": before,
+            "baseline_captured_at_ns": baseline_captured_at_ns,
+        }
+        append_runner_evidence(gen, {"event": "match_prepared", **evidence})
+        print("[关联准备] match_id=%s A=slot%d/%s sha256=%s B=slot%d/%s sha256=%s" % (
+            match["match_id"], AI_PLAYER_SLOT_BY_ALIAS["A"], installed["A"]["genome"],
+            installed["A"]["per_sha256"], AI_PLAYER_SLOT_BY_ALIAS["B"],
+            installed["B"]["genome"], installed["B"]["per_sha256"]))
 
-        before = list_recordings(cfg)
-        rec = wait_new_recording(cfg, before, timeout_min)
+        try:
+            rec = wait_new_recording(cfg, before, timeout_min)
+        except ValueError as e:
+            append_runner_evidence(gen, {
+                "event": "recording_rejected", "match_id": match["match_id"],
+                "reason": str(e),
+            })
+            print("[拒绝] %s；账本不推进。" % e)
+            break
         if rec is None:
+            append_runner_evidence(gen, {
+                "event": "recording_timeout", "match_id": match["match_id"],
+            })
             print("[超时] %d 分钟没有等到新录像，可能卡局。已暂停。" % timeout_min)
             print("       排查后重跑本命令会自动续上进度。")
             break
 
         print("[录像] %s" % rec.name)
+        after = recording_snapshot(cfg)
+        rec_path = str(rec.resolve())
+        rec_key = os.path.normcase(os.path.abspath(rec_path))
+        try:
+            candidate_keys = unique_new_recording_paths(before, after)
+        except ValueError as e:
+            append_runner_evidence(gen, {
+                "event": "recording_rejected", "match_id": match["match_id"],
+                "reason": str(e),
+            })
+            print("[拒绝] %s；账本不推进。" % e)
+            break
+        stat = rec.stat()
+        record_id = EV.ER.match_id_for_recording(rec)
+        evidence["recording"] = {
+            "path": rec_path,
+            "record_id": record_id,
+            "size_bytes": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "new_since_snapshot": len(candidate_keys) == 1 and candidate_keys[0] == rec_key,
+            "new_candidates": candidate_keys,
+        }
+        append_runner_evidence(gen, {
+            "event": "recording_associated", "match_id": match["match_id"],
+            "association": evidence,
+        })
+        print("[关联录像] match_id=%s record_id=%s path=%s new=%s candidates=%d" % (
+            match["match_id"], record_id, rec_path,
+            evidence["recording"]["new_since_snapshot"], len(candidate_keys)))
         try:
             info = RPT.parse_record(rec)
         except SystemExit:
@@ -335,7 +539,7 @@ def main():
         na, nb = "EvoAI_G%dP%d" % (gen, a), "EvoAI_G%dP%d" % (gen, b)
         try:
             result = match_result_from_replay(
-                info, gen, a, b, match, rec.resolve(), EV.ER.match_id_for_recording(rec))
+                info, gen, a, b, match, rec.resolve(), record_id, evidence=evidence)
         except ValueError as e:
             print("[拒绝] %s；录像保留，账本不推进。修正录像结果后重新运行。" % e)
             break

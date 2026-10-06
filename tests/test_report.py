@@ -76,7 +76,11 @@ class MgzPlayerParsingTests(unittest.TestCase):
                 return 3_923_000
 
             def get_players(self):
-                return [{"name": "Observer"}, {"name": "EvoAI_A"}, {"name": "EvoAI_B"}]
+                return [
+                    {"name": "Observer", "number": 1, "user_id": 42},
+                    {"name": "EvoAI_A", "number": 2, "user_id": 4294967295},
+                    {"name": "EvoAI_B", "number": 3, "user_id": 4294967295},
+                ]
 
             def get_achievements(self):
                 return [types.SimpleNamespace(score=n, military_score=0, razed_score=0, total_xp=0)
@@ -89,6 +93,9 @@ class MgzPlayerParsingTests(unittest.TestCase):
                 info = report.parse_record(path)
 
         self.assertEqual([player["name"] for player in info["players"]], ["Observer", "EvoAI_A", "EvoAI_B"])
+        self.assertEqual([player["slot"] for player in info["players"]], [1, 2, 3])
+        self.assertEqual([player["user_id"] for player in info["players"]],
+                         [42, 4294967295, 4294967295])
         self.assertEqual(info["players"][1]["score"], 1400)
         self.assertEqual(info["winners"], [])
         self.assertEqual(info["duration_min"], 65.4)

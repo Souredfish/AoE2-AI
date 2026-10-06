@@ -156,7 +156,8 @@ class ResultCaptureIPCTests(unittest.TestCase):
         for marker in (
                 "lifecycle Load", "lifecycle Init", "IPC StartServer result",
                 "Update polling started", "capture_ready queued after client hello",
-                "module_build", "binding acknowledgement failed",
+                "module_build", "capture_update_heartbeat", "IPC.GetStats()",
+                "binding acknowledgement failed",
                 "runner match_id bound", 'start_capture_ipc_server("Load")'):
             with self.subTest(marker=marker):
                 self.assertIn(marker, source)
@@ -168,6 +169,13 @@ class ResultCaptureIPCTests(unittest.TestCase):
 
     def test_pipe_handshake_connect_ready_bind_ack_sequence(self):
         responses = queue.Queue()
+        responses.put(json.dumps(envelope({
+            "action": "capture_update_heartbeat",
+            "module_build": CAPTURE_MODULE_BUILD,
+            "update_count": 1,
+            "hello_count": 0,
+            "ipc_stats": {"receiveDroppedInvalidRouting": 0},
+        })).encode("utf-8"))
         written = []
         events = []
         receiver = WindowsPipeCaptureReceiver(
@@ -223,11 +231,14 @@ class ResultCaptureIPCTests(unittest.TestCase):
                          ["capture_hello", "bind_match"])
         stages = [event["stage"] for event in events]
         for stage in ("pipe_connected", "capture_hello_sent", "capture_ready_received",
-                      "bind_match_sent", "match_bound_received"):
+                      "control_update_heartbeat", "bind_match_sent",
+                      "match_bound_received"):
             self.assertIn(stage, stages)
         self.assertLess(stages.index("pipe_connected"), stages.index("capture_ready_received"))
         self.assertLess(stages.index("capture_ready_received"), stages.index("bind_match_sent"))
         self.assertLess(stages.index("bind_match_sent"), stages.index("match_bound_received"))
+        self.assertLess(stages.index("control_update_heartbeat"),
+                        stages.index("capture_ready_received"))
 
     def test_stale_module_ready_is_rejected_before_binding(self):
         events = []

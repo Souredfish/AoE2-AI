@@ -274,6 +274,27 @@ function Update()
             Log("EvoLab PoC IPC binding rejected")
         end
     end
+    -- Read-only heartbeat: lets the runner distinguish an idle Update callback
+    -- from inbound routing drops without treating telemetry as handshake readiness.
+    if capture_update_count == 1 or capture_update_count % 300 == 0 then
+        local stats = capture_value(function() return IPC.GetStats() end)
+        local telemetry = {
+            action = "capture_update_heartbeat",
+            module_build = RESULT_CAPTURE_MODULE_BUILD,
+            update_count = capture_update_count,
+            hello_count = capture_hello_count,
+            ipc_stats = stats,
+        }
+        local heartbeat_ok, queued = pcall(function() return IPC.Send(telemetry) end)
+        Log("EvoLab PoC IPC Update telemetry: " .. ToJSON({
+            module_build = RESULT_CAPTURE_MODULE_BUILD,
+            update_count = capture_update_count,
+            hello_count = capture_hello_count,
+            ipc_stats = stats,
+            send_call_ok = heartbeat_ok,
+            queued = queued,
+        }))
+    end
 end
 
 function End(hasWon)

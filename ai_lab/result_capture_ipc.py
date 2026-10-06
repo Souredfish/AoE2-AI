@@ -318,6 +318,20 @@ class WindowsPipeCaptureReceiver:
                         raise OSError("AoE2Control IPC ReadFile 返回错误 %s" % status)
                 envelope = _decode_envelope(b"".join(parts).decode("utf-8"))
                 payload = envelope.get("payload")
+                if (isinstance(payload, dict)
+                        and payload.get("action") == "capture_update_heartbeat"):
+                    if payload.get("module_build") != CAPTURE_MODULE_BUILD:
+                        self._emit("control_update_heartbeat_rejected",
+                                   expected_module_build=CAPTURE_MODULE_BUILD,
+                                   actual_module_build=payload.get("module_build"))
+                        raise CaptureIPCRejected(
+                            "CONTROL Update 心跳模块构建标识不匹配")
+                    self._emit("control_update_heartbeat",
+                               module_build=payload.get("module_build"),
+                               update_count=payload.get("update_count"),
+                               hello_count=payload.get("hello_count"),
+                               ipc_stats=payload.get("ipc_stats"))
+                    continue
                 if _is_capture_ready(envelope):
                     self._ready.set()
                     self._emit("capture_ready_received", hello_attempts=self._hello_attempts,

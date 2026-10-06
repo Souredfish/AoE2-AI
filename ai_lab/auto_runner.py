@@ -90,6 +90,9 @@ def check_module_assigned():
 # 游戏与 CONTROL 生命周期
 # ------------------------------------------------------------------
 STEAM_APP_ID = "813780"
+# Transient argument passed only by this runner invocation. Never write Steam's
+# per-user LaunchOptions, which would also affect ordinary library launches.
+STEAM_RUNNER_LAUNCH_ARGS = ("SKIPINTRO",)
 
 
 def resolve_steam_exe(cfg):
@@ -117,15 +120,17 @@ def resolve_steam_exe(cfg):
 
 
 def start_game(cfg):
-    """Start AoE2 using Steam's app launcher, without extra launch options."""
+    """Start AoE2 through Steam with this runner's transient intro-skip arg."""
     steam_exe = resolve_steam_exe(cfg)
     if steam_exe is None:
         raise FileNotFoundError("未找到 Steam 客户端；请配置 game.steam_exe")
     app_id = str(cfg["game"].get("steam_app_id", STEAM_APP_ID))
     if app_id != STEAM_APP_ID:
         raise ValueError("AoE2 DE Steam App ID 不匹配: %s" % app_id)
-    print("[启动] 通过 Steam -applaunch %s 启动游戏" % app_id)
-    return subprocess.Popen([str(steam_exe), "-applaunch", app_id], cwd=str(steam_exe.parent))
+    command = [str(steam_exe), "-applaunch", app_id, *STEAM_RUNNER_LAUNCH_ARGS]
+    print("[启动] 通过 Steam -applaunch %s 启动游戏（runner 临时参数：%s）" % (
+        app_id, " ".join(STEAM_RUNNER_LAUNCH_ARGS)))
+    return subprocess.Popen(command, cwd=str(steam_exe.parent))
 
 
 def game_process_snapshot():

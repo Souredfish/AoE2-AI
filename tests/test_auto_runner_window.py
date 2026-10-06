@@ -206,7 +206,7 @@ class WindowReadinessTests(unittest.TestCase):
             launch.assert_called_once_with(cfg)
             self.assertEqual(seen_pids, [{20}])
 
-    def test_steam_launcher_uses_app_id_without_skipintro(self):
+    def test_runner_steam_launcher_passes_transient_skipintro_argument(self):
         cfg = {"game": {"install_dir": r"C:\Steam\steamapps\common\AoE2DE",
                         "exe": "AoE2DE_s.exe"}}
         steam_exe = Path("C:/Steam/steam.exe")
@@ -214,7 +214,8 @@ class WindowReadinessTests(unittest.TestCase):
                 patch.object(auto_runner.subprocess, "Popen") as popen:
             auto_runner.start_game(cfg)
         popen.assert_called_once_with(
-            [str(steam_exe), "-applaunch", "813780"], cwd=str(steam_exe.parent))
+            [str(steam_exe), "-applaunch", "813780", "SKIPINTRO"],
+            cwd=str(steam_exe.parent))
 
 
 if __name__ == "__main__":

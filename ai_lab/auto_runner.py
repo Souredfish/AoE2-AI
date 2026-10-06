@@ -22,6 +22,8 @@ auto_runner.py — 全自动跑局（AoE2Control 驱动）
 """
 
 import argparse
+import csv
+import io
 import json
 import math
 import random
@@ -98,7 +100,127 @@ def start_game(cfg):
     subprocess.Popen([str(exe)], cwd=str(exe.parent))
 
 
-def ensure_control(cfg, max_wait_s=600):
+WINDOW_MIN_WIDTH = 640
+WINDOW_MIN_HEIGHT = 360
+GAME_MAIN_WINDOW_CLASS = "Age of Empires II: Definitive Edition"
+
+# AoE2Control documents these as terminal statuses with exit code 0.
+# Do not infer readiness from the exit code alone: unknown or empty output
+# may indicate an incompatible launcher or an incomplete startup.
+CONTROL_SUCCESS_STATUSES = {
+    "Ready",
+    "Ready - Partially outdated",
+    "Ready - Requires update",
+    "Already Running!",
+}
+
+
+def evaluate_game_windows(windows):
+    """Ignore unrelated top-level windows, then fail closed on ambiguous mains."""
+    main_windows = [window for window in windows
+                    if window.get("class") == GAME_MAIN_WINDOW_CLASS]
+    if not main_windows:
+        return False, "未找到游戏主窗口类 %r（枚举到 %d 个标题窗口）" % (
+            GAME_MAIN_WINDOW_CLASS, len(windows))
+    if len(main_windows) != 1:
+        details = "; ".join(
+            "hwnd=0x%x visible=%s minimized=%s size=%dx%d title=%r class=%r" %
+            (w["hwnd"], w["visible"], w["minimized"],
+             w["width"], w["height"], w["title"], w["class"])
+            for w in main_windows)
+        return False, "游戏主窗口识别不唯一（%d 个候选：%s）" % (
+            len(main_windows), details)
+    window = main_windows[0]
+    detail = "hwnd=0x%x visible=%s minimized=%s size=%dx%d title=%r class=%r" % (
+        window["hwnd"], window["visible"], window["minimized"],
+        window["width"], window["height"], window["title"], window["class"])
+    if not window["visible"]:
+        return False, "游戏主窗口不可见（%s）" % detail
+    if window["minimized"]:
+        return False, "游戏主窗口已最小化（%s）" % detail
+    if window["width"] < WINDOW_MIN_WIDTH or window["height"] < WINDOW_MIN_HEIGHT:
+        return False, "游戏主窗口尺寸小于 640×360（%s）" % detail
+    return True, "游戏主窗口就绪（%s）" % detail
+
+
+def control_terminal_status(stdout):
+    """Return the documented Headless terminal status, or None if unknown."""
+    lines = [line.strip() for line in (stdout or "").splitlines() if line.strip()]
+    if not lines:
+        return None
+    status = lines[-1]
+    return status if status in CONTROL_SUCCESS_STATUSES else None
+
+
+def game_window_status():
+    """Return (ready, reason) for a visible, restored AoE2 game window."""
+    if sys.platform != "win32":
+        return False, "窗口状态探测仅支持 Windows"
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        out = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq AoE2DE_s.exe", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, timeout=15)
+        pids = set()
+        for row in csv.reader(io.StringIO(out.stdout or "")):
+            if len(row) >= 2 and row[0].lower() == "aoe2de_s.exe":
+                try:
+                    pids.add(int(row[1]))
+                except ValueError:
+                    pass
+        if not pids:
+            return False, "未找到 AoE2DE_s.exe 进程"
+
+        user32 = ctypes.windll.user32
+        windows = []
+        callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        @callback_type
+        def visit(hwnd, _):
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value in pids and not user32.GetWindow(hwnd, 4):  # GW_OWNER
+                rect = wintypes.RECT()
+                title = ctypes.create_unicode_buffer(512)
+                user32.GetWindowTextW(hwnd, title, len(title))
+                class_name = ctypes.create_unicode_buffer(512)
+                user32.GetClassNameW(hwnd, class_name, len(class_name))
+                if title.value and user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                    windows.append({
+                        "hwnd": int(hwnd),
+                        "title": title.value,
+                        "class": class_name.value,
+                        "visible": bool(user32.IsWindowVisible(hwnd)),
+                        "minimized": bool(user32.IsIconic(hwnd)),
+                        "width": rect.right - rect.left,
+                        "height": rect.bottom - rect.top,
+                    })
+            return True
+
+        user32.EnumWindows(visit, 0)
+        return evaluate_game_windows(windows)
+    except Exception as exc:
+        return False, "窗口探测失败: %s" % exc
+
+
+def wait_for_game_window(timeout_s, window_probe=game_window_status,
+                         poll_interval_s=2, monotonic=time.monotonic, sleep=time.sleep):
+    deadline = monotonic() + timeout_s
+    last_reason = "尚未探测"
+    while True:
+        ready, last_reason = window_probe()
+        if ready:
+            return True, last_reason
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            return False, "等待游戏窗口就绪超时（%s）" % last_reason
+        sleep(min(poll_interval_s, remaining))
+
+
+def ensure_control(cfg, max_wait_s=600, window_probe=game_window_status,
+                   control_runner=subprocess.run, monotonic=time.monotonic, sleep=time.sleep):
     """确保游戏运行且 CONTROL 就绪。返回 True/False。"""
     launcher = Path(cfg["control"]["launcher"])
     if not launcher.is_absolute():
@@ -112,12 +234,17 @@ def ensure_control(cfg, max_wait_s=600):
         start_game(cfg)
         print("[等待] 游戏启动中（首次启动可能需要 1~2 分钟）...")
 
-    deadline = time.time() + max_wait_s
-    while time.time() < deadline:
+    deadline = monotonic() + max_wait_s
+    last_window_reason = "未检测"
+    while monotonic() < deadline:
         if not game_running():
-            time.sleep(10)
+            sleep(min(10, max(0, deadline - monotonic())))
             continue
-        proc = subprocess.run(
+        ready, last_window_reason = window_probe()
+        if not ready:
+            sleep(min(2, max(0, deadline - monotonic())))
+            continue
+        proc = control_runner(
             [str(launcher), "--headless", "--timeout-ms", "120000"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=180)
@@ -125,13 +252,20 @@ def ensure_control(cfg, max_wait_s=600):
         last = [l for l in out.splitlines() if l.strip()]
         print("[CONTROL] %s (exit=%d)" % (last[-1] if last else "无输出", proc.returncode))
         if proc.returncode == 0:
-            return True
+            status = control_terminal_status(out)
+            if status is not None:
+                return True
+            print("[错误] CONTROL 返回 exit 0，但没有可识别的成功状态（末行：%s）" %
+                  (last[-1].strip() if last else "无输出"))
+            return False
         if proc.returncode in (6, 7):
-            time.sleep(15)  # 游戏还没起来/窗口未就绪，继续等
+            last_window_reason = "Headless exit %d: %s" % (
+                proc.returncode, last[-1] if last else "无输出")
+            sleep(min(2, max(0, deadline - monotonic())))
             continue
         print("[错误] CONTROL 启动失败，输出：\n%s" % out)
         return False
-    print("[错误] 等待游戏/CONTROL 超时")
+    print("[错误] 等待游戏窗口/CONTROL 超时（窗口状态：%s）" % last_window_reason)
     return False
 
 

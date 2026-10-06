@@ -72,7 +72,7 @@ class AiBuilderCoverageTests(unittest.TestCase):
             MK.build_per_text(template, G.default_genome(), "Missing")
 
     def test_unrelated_official_constants_are_ignored(self):
-        extras = "\n".join("(defconst official-extra-%d 1)" % i for i in range(865))
+        extras = "\n".join("(defconst phase1-official-extra-%d 1)" % i for i in range(865))
         template = builder_template() + "\n" + extras
         result = MK.build_per_text(template, G.default_genome(), "OfficialExtras")
         for name, value in G.default_genome().items():

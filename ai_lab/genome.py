@@ -112,18 +112,61 @@ def clamp(genome):
 
 
 def _normalize(genome):
-    """每个相位的四类采集百分比归一化到 100，保证经济引擎拿到合法配比。"""
+    """将四类采集配比投影到各自 SPEC 边界内，且每相位总和为 100。"""
     g = dict(genome)
     for ph in PHASES:
         keys = [f"phase{ph}-{res}" for res in GATHERERS]
-        vals = [max(0, int(g.get(k, 0))) for k in keys]
-        total = sum(vals)
-        if total <= 0:
-            vals = [55, 30, 15, 0]
-            total = 100
-        scaled = [v * 100 // total for v in vals]
-        scaled[-2] += 100 - sum(scaled)  # 余数补到金矿，误差 ±1 可接受
-        for k, v in zip(keys, scaled):
+        bounds = {}
+        for tmpl, lo, hi, _ in SPEC:
+            if tmpl.format(n=ph) in keys:
+                bounds[tmpl.format(n=ph)] = (lo, hi)
+        lows = [bounds[k][0] for k in keys]
+        highs = [bounds[k][1] for k in keys]
+        raw = [max(0, int(g.get(k, 0))) for k in keys]
+        if sum(raw) == 0:
+            raw = [55, 30, 15, 0]
+
+        # Scale only unconstrained entries, fixing entries that hit a bound.
+        active = set(range(len(keys)))
+        vals = [0.0] * len(keys)
+        remaining = 100.0
+        while active:
+            weight = sum(raw[i] for i in active)
+            shares = {i: remaining / len(active) if weight == 0 else remaining * raw[i] / weight
+                      for i in active}
+            clipped = [i for i in active if shares[i] < lows[i] or shares[i] > highs[i]]
+            if not clipped:
+                for i in active:
+                    vals[i] = shares[i]
+                break
+            for i in clipped:
+                vals[i] = float(lows[i] if shares[i] < lows[i] else highs[i])
+                remaining -= vals[i]
+                active.remove(i)
+
+        ints = [int(v) for v in vals]
+        # Largest-remainder allocation preserves the total without crossing bounds.
+        remainder = 100 - sum(ints)
+        order = sorted(range(len(keys)), key=lambda i: vals[i] - ints[i], reverse=True)
+        while remainder > 0:
+            progressed = False
+            for i in order:
+                if ints[i] < highs[i]:
+                    ints[i] += 1
+                    remainder -= 1
+                    progressed = True
+                    if remainder == 0:
+                        break
+            if not progressed:
+                raise ValueError("gatherer SPEC bounds cannot sum to 100")
+        while remainder < 0:
+            for i in reversed(order):
+                if ints[i] > lows[i]:
+                    ints[i] -= 1
+                    remainder += 1
+                    if remainder == 0:
+                        break
+        for k, v in zip(keys, ints):
             g[k] = int(v)
     return g
 

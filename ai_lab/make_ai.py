@@ -15,6 +15,8 @@ make_ai.py — 把基因组渲染成可上场的 AI
 """
 
 import argparse
+from collections import Counter
+import hashlib
 import json
 import random
 import re
@@ -25,6 +27,16 @@ sys.path.insert(0, str(Path(__file__).parent))
 import genome as G  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
+CONSTANT_RE = re.compile(r"\(defconst\s+(phase[1-5]-[A-Za-z0-9_-]+)\s+[-+\d.]+\s*\)")
+
+
+def expected_constants():
+    return {tmpl.format(n=ph) for tmpl, _, _, _ in G.SPEC for ph in G.PHASES}
+
+
+def constants_fingerprint(names):
+    payload = "\n".join(sorted(names)).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def load_config():
@@ -81,38 +93,51 @@ def gene_hash(gene):
 
 
 def build_per_text(base_text, gene, name):
-    """替换 defconst 值并追加注入规则，返回 (新脚本文本, 未命中的基因列表)。"""
-    missing = []
+    """校验 AiBuilder 参数面版本并完整替换后返回生成脚本。"""
+    gene = G._normalize(G.clamp(gene))
+    expected = expected_constants()
+    definitions = Counter(CONSTANT_RE.findall(base_text))
+    actual = {name for name in definitions if name in expected}
+    expected_fingerprint = constants_fingerprint(expected)
+    actual_fingerprint = constants_fingerprint(actual)
+    missing = sorted(expected - actual)
+    duplicates = sorted(name for name in expected if definitions[name] > 1)
+    if missing or duplicates:
+        raise ValueError(
+            "AiBuilder 目标参数缺失或重复 (expected=%s actual=%s missing=%d duplicate=%d)"
+            % (expected_fingerprint[:12], actual_fingerprint[:12], len(missing), len(duplicates))
+        )
+    if set(gene) != expected:
+        raise ValueError("基因常量集合不完整：expected=%d actual=%d" % (len(expected), len(gene)))
+
     text = base_text
     for const_name, value in sorted(gene.items()):
         pattern = re.compile(
             r"\(defconst\s+" + re.escape(const_name) + r"\s+[-\d.]+\s*\)"
         )
         repl = "(defconst %s %d)" % (const_name, int(value))
-        if pattern.search(text):
-            text = pattern.sub(repl, text, count=1)
-        else:
-            missing.append(const_name)
+        matches = pattern.findall(text)
+        if len(matches) != 1:
+            raise ValueError("AiBuilder 常量必须且只能定义一次：%s (count=%d)" % (const_name, len(matches)))
+        text = pattern.sub(repl, text, count=1)
     header = (
         "; ==== EvoLab generated AI: %s ====\n"
         "; Based on official AiBuilder, parameters evolved by genetic algorithm\n\n" % name
     )
     text = header + text + INTRO_RULE.replace("__NAME__", name).replace("__HASH__", gene_hash(gene)) + PHASE_RULES
-    return text, missing
+    return text
 
 
 def install(name, gene, cfg):
+    gene = G._normalize(G.clamp(gene))
     ai_dir = Path(cfg["game"]["ai_dir"])
     base_path = ai_dir / cfg["game"]["base_script"]
     if not base_path.exists():
         sys.exit("找不到底座脚本: %s" % base_path)
     base_text = base_path.read_text(encoding="latin-1")
 
-    per_text, missing = build_per_text(base_text, gene, name)
-    if missing:
-        print("[警告] %d 个基因在底座脚本中未找到对应 defconst，已跳过：" % len(missing))
-        for m in missing[:10]:
-            print("        " + m)
+    # Validate everything before writing either generated file.
+    per_text = build_per_text(base_text, gene, name)
 
     safe = re.sub(r"[^A-Za-z0-9_-]", "_", name)
     per_path = ai_dir / ("EvoAI_%s.per" % safe)

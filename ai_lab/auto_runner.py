@@ -298,10 +298,8 @@ def validate_match_evidence(info, gen, a, b, match, record, record_id, evidence)
 
 
 def _valid_score(value):
-    return value is None or (
-        isinstance(value, (int, float)) and not isinstance(value, bool)
-        and (isinstance(value, int) or math.isfinite(value))
-    )
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and (isinstance(value, int) or math.isfinite(value)))
 
 
 def resolve_winner(info, gen, a, b, players_by_identity=None):
@@ -344,9 +342,9 @@ def match_result_from_replay(info, gen, a, b, match, record, record_id, evidence
             info, gen, a, b, match, record, record_id, evidence)
     if players_by_identity is None:
         raise ValueError("录像未能唯一映射到 EvoAI_A 与 EvoAI_B")
-    if any(not _valid_score(player.get("score"))
-           for player in players_by_identity.values()):
-        raise ValueError("录像比分必须是有限数值或缺失")
+    if any(not _valid_score(players_by_identity[alias].get("score"))
+           for alias in ("EvoAI_A", "EvoAI_B")):
+        raise ValueError("录像缺少有效比分；必须包含双方有限数值比分")
     winner_name = resolve_winner(info, gen, a, b, players_by_identity)
     if winner_name not in (na, nb):
         raise ValueError("录像胜者无效、多个胜者或无法唯一判定")
@@ -364,6 +362,18 @@ def match_result_from_replay(info, gen, a, b, match, record, record_id, evidence
         "record_id": record_id,
         **({"association": evidence} if evidence is not None else {}),
     }
+
+
+def record_validated_result(results, info, gen, a, b, match, record, record_id,
+                            manifest, results_path, evidence=None):
+    """Validate a replay completely before it can reach ledger or fitness inputs."""
+    result = match_result_from_replay(
+        info, gen, a, b, match, record, record_id, evidence=evidence)
+    candidate_results = [*results, result]
+    EV.ER.reconcile_results(candidate_results, manifest)
+    EV.ER.write_results(results_path, candidate_results)
+    results.append(result)
+    return result
 
 
 def append_runner_evidence(gen, event):
@@ -536,26 +546,15 @@ def main():
             info = {"players": [], "winners": []}
             print("[警告] 录像解析失败: %s" % e)
 
-        na, nb = "EvoAI_G%dP%d" % (gen, a), "EvoAI_G%dP%d" % (gen, b)
         try:
-            result = match_result_from_replay(
-                info, gen, a, b, match, rec.resolve(), record_id, evidence=evidence)
+            result = record_validated_result(
+                results, info, gen, a, b, match, rec.resolve(), record_id,
+                manifest, res_file, evidence=evidence)
         except ValueError as e:
-            print("[拒绝] %s；录像保留，账本不推进。修正录像结果后重新运行。" % e)
+            print("[拒绝] %s；录像保留，账本与 fitness 输入均不推进。修正录像结果后重新运行。" % e)
             break
         winner_name = result["winners"][0]
-        results.append(result)
-        try:
-            EV.ER.reconcile_results(results, manifest)
-        except ValueError as e:
-            results.pop()
-            print("[拒绝] 对局结果未写入账本：%s" % e)
-            break
-        EV.ER.write_results(res_file, results)
-        if winner_name:
-            print("[结果] 胜者: %s" % winner_name)
-        else:
-            print("[结果] 未能自动判定胜者，积分时按无胜者处理（可人工核对录像）")
+        print("[结果] 胜者: %s" % winner_name)
     else:
         print()
         print("[完成] 本次赛程全部跑完！")

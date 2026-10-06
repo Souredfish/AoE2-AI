@@ -10,8 +10,8 @@ class WinnerIdentityTests(unittest.TestCase):
     def test_reverse_replay_order_maps_winner_to_installed_genome(self):
         info = {"players": [
             {"name": "Observer"},
-            {"name": "EvoAI_B", "winner": True},
-            {"name": "EvoAI_A", "winner": False},
+            {"name": "EvoAI_B", "winner": True, "score": 900},
+            {"name": "EvoAI_A", "winner": False, "score": 1200},
         ]}
 
         self.assertEqual(auto_runner.resolve_winner(info, 4, 2, 7), "EvoAI_G4P7")

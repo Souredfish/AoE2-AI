@@ -153,6 +153,41 @@ class ReplayLedgerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "多个胜者"):
             self._result(info)
 
+    def test_degenerate_replay_without_winner_or_scores_never_writes_ledger(self):
+        info = {"players": [
+            {"name": "EvoAI_A", "winner": False, "score": None},
+            {"name": "EvoAI_B", "winner": False, "score": None},
+        ]}
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "results.json"
+            original = b'{"existing": "ledger"}\n'
+            ledger.write_bytes(original)
+            results = []
+
+            with self.assertRaisesRegex(ValueError, "缺少有效比分"):
+                auto_runner.record_validated_result(
+                    results, info, 4, 2, 7, self.match,
+                    "degenerate.aoe2record", "degenerate-record",
+                    self.manifest, ledger)
+
+            self.assertEqual(results, [])
+            self.assertEqual(ledger.read_bytes(), original)
+
+    def test_explicit_winner_without_both_scores_is_rejected(self):
+        info = {"players": [
+            {"name": "EvoAI_A", "winner": True, "score": 1850},
+            {"name": "EvoAI_B", "winner": False, "score": None},
+        ]}
+        with self.assertRaisesRegex(ValueError, "缺少有效比分"):
+            self._result(info)
+
+    def test_missing_winner_marker_can_only_use_unequal_valid_scores(self):
+        with self.assertRaisesRegex(ValueError, "胜者无效"):
+            self._result({"players": [
+                {"name": "EvoAI_A", "score": 1850},
+                {"name": "EvoAI_B", "score": 1850},
+            ]})
+
     def test_non_finite_or_non_numeric_replay_score_is_rejected(self):
         for invalid in (float("nan"), float("inf"), float("-inf"), "high"):
             info = {"players": [

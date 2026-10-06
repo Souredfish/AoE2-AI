@@ -102,6 +102,7 @@ def start_game(cfg):
 
 WINDOW_MIN_WIDTH = 640
 WINDOW_MIN_HEIGHT = 360
+GAME_MAIN_WINDOW_CLASS = "Age of Empires II: Definitive Edition"
 
 # AoE2Control documents these as terminal statuses with exit code 0.
 # Do not infer readiness from the exit code alone: unknown or empty output
@@ -115,20 +116,24 @@ CONTROL_SUCCESS_STATUSES = {
 
 
 def evaluate_game_windows(windows):
-    """Fail closed unless exactly one candidate main window is ready."""
-    if not windows:
-        return False, "未找到游戏进程的无主标题窗口"
-    if len(windows) != 1:
+    """Ignore unrelated top-level windows, then fail closed on ambiguous mains."""
+    main_windows = [window for window in windows
+                    if window.get("class") == GAME_MAIN_WINDOW_CLASS]
+    if not main_windows:
+        return False, "未找到游戏主窗口类 %r（枚举到 %d 个标题窗口）" % (
+            GAME_MAIN_WINDOW_CLASS, len(windows))
+    if len(main_windows) != 1:
         details = "; ".join(
-            "hwnd=0x%x visible=%s minimized=%s size=%dx%d title=%r" %
+            "hwnd=0x%x visible=%s minimized=%s size=%dx%d title=%r class=%r" %
             (w["hwnd"], w["visible"], w["minimized"],
-             w["width"], w["height"], w["title"])
-            for w in windows)
-        return False, "游戏主窗口识别不唯一（%d 个候选：%s）" % (len(windows), details)
-    window = windows[0]
-    detail = "hwnd=0x%x visible=%s minimized=%s size=%dx%d title=%r" % (
+             w["width"], w["height"], w["title"], w["class"])
+            for w in main_windows)
+        return False, "游戏主窗口识别不唯一（%d 个候选：%s）" % (
+            len(main_windows), details)
+    window = main_windows[0]
+    detail = "hwnd=0x%x visible=%s minimized=%s size=%dx%d title=%r class=%r" % (
         window["hwnd"], window["visible"], window["minimized"],
-        window["width"], window["height"], window["title"])
+        window["width"], window["height"], window["title"], window["class"])
     if not window["visible"]:
         return False, "游戏主窗口不可见（%s）" % detail
     if window["minimized"]:
@@ -180,10 +185,13 @@ def game_window_status():
                 rect = wintypes.RECT()
                 title = ctypes.create_unicode_buffer(512)
                 user32.GetWindowTextW(hwnd, title, len(title))
+                class_name = ctypes.create_unicode_buffer(512)
+                user32.GetClassNameW(hwnd, class_name, len(class_name))
                 if title.value and user32.GetWindowRect(hwnd, ctypes.byref(rect)):
                     windows.append({
                         "hwnd": int(hwnd),
                         "title": title.value,
+                        "class": class_name.value,
                         "visible": bool(user32.IsWindowVisible(hwnd)),
                         "minimized": bool(user32.IsIconic(hwnd)),
                         "width": rect.right - rect.left,

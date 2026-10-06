@@ -10,10 +10,24 @@ from ai_lab import auto_runner
 class WindowReadinessTests(unittest.TestCase):
     def _window(self, hwnd=1, visible=True, minimized=False, width=1382, height=807):
         return {
-            "hwnd": hwnd, "title": "Age of Empires II: Definitive Edition",
+            "hwnd": hwnd,
+            "title": "Age of Empires II: Definitive Edition",
+            "class": auto_runner.GAME_MAIN_WINDOW_CLASS,
             "visible": visible, "minimized": minimized,
             "width": width, "height": height,
         }
+
+    def test_game_window_gate_ignores_directshow_helper_windows(self):
+        main = self._window()
+        helpers = [
+            {"hwnd": 2, "title": "EVR Fullscreen Window", "class": "EVRFullscreenVideo",
+             "visible": False, "minimized": False, "width": 400, "height": 300},
+            {"hwnd": 3, "title": "ActiveMovie Window", "class": "FilterGraphWindow",
+             "visible": False, "minimized": False, "width": 320, "height": 240},
+        ]
+        ready, reason = auto_runner.evaluate_game_windows([*helpers, main])
+        self.assertTrue(ready)
+        self.assertIn("hwnd=0x1", reason)
 
     def test_game_window_gate_rejects_unready_or_ambiguous_main_window(self):
         cases = [
@@ -23,6 +37,8 @@ class WindowReadinessTests(unittest.TestCase):
             ([self._window(visible=False), self._window(hwnd=2)], "识别不唯一"),
             ([self._window(minimized=True, width=160, height=28),
               self._window(hwnd=2)], "识别不唯一"),
+            ([self._window(), {**self._window(hwnd=2), "title": "Second game window"}],
+             "识别不唯一"),
         ]
         for windows, expected_reason in cases:
             with self.subTest(windows=windows):

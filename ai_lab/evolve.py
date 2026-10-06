@@ -131,36 +131,12 @@ def cmd_report(args, cfg):
         if (record_id and row.get("record_id") == record_id) or same_path:
             print("[幂等] 该录像已记入单局 %s，不重复计分" % row["match_id"])
             return
-    names = [p.get("name") for p in info.get("players", [])]
-    indices = [ER.individual_from_name(name, cur, pop) for name in names]
-    indices = [i for i in indices if i is not None]
-    if len(indices) != 2 or indices[0] == indices[1]:
-        sys.exit("[拒绝] 战报未能解析为本代两个不同参赛个体")
-    scheduled = next((m for m in manifest["matches"]
-                      if frozenset(ER.individual_from_name(n, cur, pop) for n in m["players"]) == frozenset(indices)
-                      and m["match_id"] not in accepted), None)
-    if scheduled is None:
-        sys.exit("[拒绝] 该参赛组合不在未完成赛程中")
-    winners = info.get("winners") or []
-    winner_ids = [ER.individual_from_name(n, cur, pop) for n in winners]
-    if len(winner_ids) != 1 or winner_ids[0] not in indices:
-        sys.exit("[拒绝] 战报胜者无效或无法唯一确定；修正战报后再导入")
-    winner = scheduled["players"][indices.index(winner_ids[0])]
-    players = scheduled["players"]
-    scores = {}
-    for p in info.get("players", []):
-        i = ER.individual_from_name(p.get("name"), cur, pop)
-        if i is not None:
-            scores[ER.individual_name(cur, i)] = p.get("score")
-    results.append({
-        "match_id": scheduled["match_id"],
-        "players": [[players[0], winner == players[0]], [players[1], winner == players[1]]],
-        "winners": [winner],
-        "scores": scores,
-        "duration_min": info.get("duration_min"),
-        "record": canonical_record,
-        "record_id": record_id,
-    })
+    try:
+        result = result_row_from_report(
+            info, cur, pop, manifest, accepted, canonical_record, record_id)
+    except ValueError as e:
+        sys.exit("[拒绝] 战报未写入账本：%s" % e)
+    results.append(result)
     try:
         ER.reconcile_results(results, manifest)
     except ValueError as e:
@@ -168,6 +144,45 @@ def cmd_report(args, cfg):
         sys.exit("[拒绝] 结果未写入账本：%s" % e)
     ER.write_results(res_file, results)
     print("[记账] 第 %d 代已记录 %d 场对局 → %s" % (cur, len(results), res_file))
+
+
+def result_row_from_report(info, gen, pop, manifest, accepted,
+                           canonical_record=None, record_id=None):
+    """Convert report identities into the scheduled ledger order, independent of replay order."""
+    indices = [ER.individual_from_name(p.get("name"), gen, pop)
+               for p in info.get("players", [])]
+    indices = [index for index in indices if index is not None]
+    if len(indices) != 2 or indices[0] == indices[1]:
+        raise ValueError("战报未能解析为本代两个不同参赛个体")
+
+    scheduled = next((match for match in manifest["matches"]
+                      if frozenset(ER.individual_from_name(name, gen, pop)
+                                   for name in match["players"]) == frozenset(indices)
+                      and match["match_id"] not in accepted), None)
+    if scheduled is None:
+        raise ValueError("该参赛组合不在未完成赛程中")
+
+    winners = info.get("winners") or []
+    winner_ids = [ER.individual_from_name(name, gen, pop) for name in winners]
+    if len(winner_ids) != 1 or winner_ids[0] not in indices:
+        raise ValueError("战报胜者无效或无法唯一确定；必须且只能有一个参赛胜者")
+
+    winner = ER.individual_name(gen, winner_ids[0])
+    players = scheduled["players"]
+    scores = {}
+    for player in info.get("players", []):
+        index = ER.individual_from_name(player.get("name"), gen, pop)
+        if index is not None:
+            scores[ER.individual_name(gen, index)] = player.get("score")
+    return {
+        "match_id": scheduled["match_id"],
+        "players": [[players[0], winner == players[0]], [players[1], winner == players[1]]],
+        "winners": [winner],
+        "scores": scores,
+        "duration_min": info.get("duration_min"),
+        "record": canonical_record,
+        "record_id": record_id,
+    }
 
 
 def current_gen():

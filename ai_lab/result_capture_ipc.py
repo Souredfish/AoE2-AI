@@ -57,6 +57,22 @@ def _decode_envelope(message):
     return envelope
 
 
+def _is_capture_ready(envelope):
+    payload = envelope.get("payload")
+    return (isinstance(payload, dict)
+            and payload.get("action") == "capture_ready"
+            and payload.get("protocol_version") == 1)
+
+
+def _binding_request(match_id):
+    if not isinstance(match_id, str) or not match_id.strip():
+        raise CaptureIPCRejected("runner match_id 为空，不能请求 IPC 绑定")
+    return {
+        "target": {"assignedPlayerId": 1, "moduleName": "evolab_driver"},
+        "payload": {"action": "bind_match", "match_id": match_id},
+    }
+
+
 def parse_ipc_envelope(message):
     """Validate a CONTROL outgoing capture envelope and retain payload exactly."""
     envelope = _decode_envelope(message)
@@ -208,6 +224,11 @@ class WindowsPipeCaptureReceiver:
         self._handle = None
         self._error = None
         self._row = None
+        self._handshake_phase = "connecting"
+
+    @property
+    def handshake_phase(self):
+        return self._handshake_phase
 
     def start(self):
         if os.name != "nt":
@@ -237,13 +258,10 @@ class WindowsPipeCaptureReceiver:
                     self._stop.wait(0.5)
             if self._stop.is_set():
                 return
+            self._handshake_phase = "waiting_for_control_ready"
             win32pipe.SetNamedPipeHandleState(
                 self._handle, win32pipe.PIPE_READMODE_MESSAGE, None, None)
-            binding = {
-                "target": {"assignedPlayerId": 1, "moduleName": "evolab_driver"},
-                "payload": {"action": "bind_match", "match_id": self.match_id},
-            }
-            win32file.WriteFile(self._handle, json.dumps(binding).encode("utf-8"))
+            binding_sent = False
             while not self._stop.is_set():
                 parts = []
                 while True:
@@ -255,11 +273,22 @@ class WindowsPipeCaptureReceiver:
                         raise OSError("AoE2Control IPC ReadFile 返回错误 %s" % status)
                 envelope = _decode_envelope(b"".join(parts).decode("utf-8"))
                 payload = envelope.get("payload")
+                if _is_capture_ready(envelope):
+                    if not binding_sent:
+                        binding = _binding_request(self.match_id)
+                        win32file.WriteFile(
+                            self._handle, json.dumps(binding).encode("utf-8"))
+                        binding_sent = True
+                        self._handshake_phase = "waiting_for_match_bound"
+                    continue
                 if (isinstance(payload, dict) and payload.get("action") == "match_bound"
                         and payload.get("match_id") == self.match_id):
+                    if not binding_sent:
+                        raise CaptureIPCRejected("收到绑定确认前未发送 runner bind_match")
                     if self._bound.is_set():
                         raise CaptureIPCRejected("重复收到 runner match_id 绑定确认")
                     self._bound.set()
+                    self._handshake_phase = "bound"
                     continue
                 if not self._bound.is_set():
                     raise CaptureIPCRejected("收到原始 sentinel 前未确认 runner match_id 绑定")
@@ -268,6 +297,7 @@ class WindowsPipeCaptureReceiver:
                 self._received.set()
         except Exception as exc:
             self._error = exc
+            self._handshake_phase = "failed"
             self._bound.set()
             self._received.set()
 
@@ -281,7 +311,8 @@ class WindowsPipeCaptureReceiver:
         if not self._bound.wait(timeout_s):
             if self._error is not None:
                 raise CaptureIPCRejected("runner match_id 绑定失败：%s" % self._error) from self._error
-            return False
+            raise CaptureIPCRejected(
+                "runner match_id 绑定超时，握手阶段=%s" % self._handshake_phase)
         if self._error is not None:
             raise CaptureIPCRejected("runner match_id 绑定失败：%s" % self._error) from self._error
         return True

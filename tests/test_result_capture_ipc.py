@@ -5,7 +5,9 @@ from pathlib import Path
 
 from ai_lab.result_capture_ipc import (CaptureIPCRejected, append_capture_association,
                                        append_raw_capture,
-                                       load_raw_capture, parse_ipc_envelope)
+                                       load_raw_capture, parse_ipc_envelope,
+                                       WindowsPipeCaptureReceiver, _binding_request,
+                                       _is_capture_ready)
 
 
 def envelope(payload=None, source=None):
@@ -95,6 +97,25 @@ class ResultCaptureIPCTests(unittest.TestCase):
             with self.assertRaisesRegex(CaptureIPCRejected, "已存在"):
                 append_raw_capture(path, message, "g0-m0001")
             self.assertEqual(path.read_bytes(), before)
+
+    def test_binding_request_targets_the_assigned_module_and_match(self):
+        self.assertEqual(_binding_request("g0-m0001"), {
+            "target": {"assignedPlayerId": 1, "moduleName": "evolab_driver"},
+            "payload": {"action": "bind_match", "match_id": "g0-m0001"},
+        })
+        with self.assertRaisesRegex(CaptureIPCRejected, "match_id"):
+            _binding_request("")
+
+    def test_server_ready_requires_supported_handshake_version(self):
+        ready = envelope({"action": "capture_ready", "protocol_version": 1})
+        self.assertTrue(_is_capture_ready(ready))
+        ready["payload"]["protocol_version"] = 2
+        self.assertFalse(_is_capture_ready(ready))
+
+    def test_binding_wait_times_out_without_confirmation(self):
+        receiver = WindowsPipeCaptureReceiver("unused.jsonl", "g0-m0001")
+        with self.assertRaisesRegex(CaptureIPCRejected, "握手阶段=connecting"):
+            receiver.wait_until_bound(0.001)
 
 
 if __name__ == "__main__":

@@ -183,6 +183,19 @@ function Update()
     if not capture_enabled or not capture_ipc_started.ok then
         return
     end
+    -- Let the client know the server is live before asking it to bind this
+    -- match. Avoid queuing unsolicited messages when nobody is connected.
+    local stats_ok, stats = pcall(function() return IPC.GetStats() end)
+    if stats_ok and type(stats) == "table" and type(stats.connectedClients) == "number"
+        and stats.connectedClients > 0
+        and capture_match_id == nil then
+        local ready_ok, queued = pcall(function()
+            return IPC.Send({ action = "capture_ready", protocol_version = 1 })
+        end)
+        if not ready_ok or queued ~= true then
+            Log("EvoLab PoC IPC ready announcement failed: " .. tostring(queued))
+        end
+    end
     local ok, messages = pcall(function() return IPC.GetMessages() end)
     if not ok or type(messages) ~= "table" then
         return
@@ -191,10 +204,16 @@ function Update()
         local parsed = ParseJSON(raw)
         if type(parsed) == "table" and parsed.action == "bind_match"
             and type(parsed.match_id) == "string" and parsed.match_id ~= ""
-            and capture_match_id == nil then
-            capture_match_id = parsed.match_id
-            IPC.Send({ action = "match_bound", match_id = capture_match_id })
-            Log("EvoLab PoC runner match_id bound: " .. capture_match_id)
+            and (capture_match_id == nil or capture_match_id == parsed.match_id) then
+            local sent_ok, queued = pcall(function()
+                return IPC.Send({ action = "match_bound", match_id = parsed.match_id })
+            end)
+            if sent_ok and queued == true then
+                capture_match_id = parsed.match_id
+                Log("EvoLab PoC runner match_id bound: " .. capture_match_id)
+            else
+                Log("EvoLab PoC IPC binding acknowledgement failed: " .. tostring(queued))
+            end
         else
             Log("EvoLab PoC IPC binding rejected")
         end

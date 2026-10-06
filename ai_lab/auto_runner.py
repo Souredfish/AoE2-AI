@@ -162,22 +162,36 @@ def wait_new_recording(cfg, before, timeout_min):
 
 
 def resolve_winner(info, gen, a, b):
-    """返回胜者个体名 'EvoAI_G{gen}P{a|b}' 或 None。
-    玩家槽位约定：P1=观察者（索引0，恒输），P2=EvoAI_A=个体a（索引1），P3=EvoAI_B=个体b（索引2）。
-    mgz 的 players 列表顺序即玩家号顺序。"""
-    names = {1: "EvoAI_G%dP%d" % (gen, a), 2: "EvoAI_G%dP%d" % (gen, b)}
-    players = info.get("players", [])
-    # 1) mgz postgame 的 winner 标记
-    for i, p in enumerate(players):
-        if p.get("winner") and i in names:
-            return names[i]
-    # 2) 比分定胜负
-    ai_players = [players[i] for i in (1, 2) if i < len(players)]
-    if len(ai_players) == 2:
-        s1, s2 = ai_players[0].get("score"), ai_players[1].get("score")
-        if isinstance(s1, (int, float)) and isinstance(s2, (int, float)) and s1 != s2:
-            idx = 1 if s1 > s2 else 2
-            return names[idx]
+    """Map replay AI identities to the genomes installed in EvoAI_A and EvoAI_B."""
+    identity_to_genome = {
+        "EvoAI_A": "EvoAI_G%dP%d" % (gen, a),
+        "EvoAI_B": "EvoAI_G%dP%d" % (gen, b),
+    }
+    players_by_identity = {}
+    for player in info.get("players", []):
+        # The replay order can differ from the lobby slot order. The stable AI
+        # name is the identity; the list index is not.
+        name = str(player.get("name", ""))
+        identity = next((key for key in identity_to_genome if key in name), None)
+        if identity:
+            if identity in players_by_identity:
+                return None
+            players_by_identity[identity] = player
+
+    if set(players_by_identity) != set(identity_to_genome):
+        return None
+
+    for identity, player in players_by_identity.items():
+        if player.get("winner"):
+            return identity_to_genome[identity]
+
+    # If the replay has no explicit winner marker, compare scores by identity.
+    score_a = players_by_identity["EvoAI_A"].get("score")
+    score_b = players_by_identity["EvoAI_B"].get("score")
+    if (isinstance(score_a, (int, float)) and isinstance(score_b, (int, float))
+            and score_a != score_b):
+        identity = "EvoAI_A" if score_a > score_b else "EvoAI_B"
+        return identity_to_genome[identity]
     return None
 
 
@@ -283,10 +297,11 @@ def main():
         na, nb = "EvoAI_G%dP%d" % (gen, a), "EvoAI_G%dP%d" % (gen, b)
         scores = {}
         players = info.get("players", [])
-        for i, p in enumerate(players):
-            if i == 1:
+        for p in players:
+            name = str(p.get("name", ""))
+            if "EvoAI_A" in name:
                 scores[na] = p.get("score")
-            elif i == 2:
+            elif "EvoAI_B" in name:
                 scores[nb] = p.get("score")
         if winner_name not in (na, nb):
             print("[拒绝] 未能唯一判定本局胜者；录像保留，账本不推进。修正胜者后重新运行。")

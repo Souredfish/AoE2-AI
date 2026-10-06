@@ -17,6 +17,7 @@ from pathlib import Path
 PIPE_NAME = "EvoLabResultCaptureV1"
 PIPE_PATH = "\\\\.\\pipe\\" + PIPE_NAME
 CAPTURE_PREFIX = "EVOLAB_RESULT_CAPTURE_V1:"
+CAPTURE_MODULE_BUILD = "sour100-ipc-update-poll-v2"
 _MATCH_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 
@@ -61,7 +62,8 @@ def _is_capture_ready(envelope):
     payload = envelope.get("payload")
     return (isinstance(payload, dict)
             and payload.get("action") == "capture_ready"
-            and payload.get("protocol_version") == 1)
+            and payload.get("protocol_version") == 1
+            and payload.get("module_build") == CAPTURE_MODULE_BUILD)
 
 
 def _capture_hello_request():
@@ -318,7 +320,8 @@ class WindowsPipeCaptureReceiver:
                 payload = envelope.get("payload")
                 if _is_capture_ready(envelope):
                     self._ready.set()
-                    self._emit("capture_ready_received", hello_attempts=self._hello_attempts)
+                    self._emit("capture_ready_received", hello_attempts=self._hello_attempts,
+                               module_build=CAPTURE_MODULE_BUILD)
                     if not self._binding_sent:
                         binding = _binding_request(self.match_id)
                         with self._write_lock:
@@ -328,6 +331,14 @@ class WindowsPipeCaptureReceiver:
                         self._handshake_phase = "waiting_for_match_bound"
                         self._emit("bind_match_sent", match_id=self.match_id)
                     continue
+                if (isinstance(payload, dict)
+                        and payload.get("action") == "capture_ready"):
+                    self._emit("capture_ready_rejected",
+                               expected_module_build=CAPTURE_MODULE_BUILD,
+                               actual_module_build=payload.get("module_build"),
+                               protocol_version=payload.get("protocol_version"))
+                    raise CaptureIPCRejected(
+                        "CONTROL capture_ready 模块构建标识不匹配；请确认已加载本 runner 部署的 Lua")
                 if (isinstance(payload, dict) and payload.get("action") == "match_bound"
                         and payload.get("match_id") == self.match_id):
                     if not self._binding_sent:

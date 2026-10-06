@@ -70,8 +70,15 @@ def deploy_module(cfg):
     src = Path(__file__).parent / "control" / "evolab_driver"
     dst = appdata() / "CONTROL" / "AoE2Control" / "modules" / "evolab_driver"
     dst.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src / "evolab_driver.main.lua", dst / "evolab_driver.main.lua")
-    print("[部署] 驱动模块 → %s" % dst)
+    source_file = src / "evolab_driver.main.lua"
+    deployed_file = dst / "evolab_driver.main.lua"
+    shutil.copy2(source_file, deployed_file)
+    source_sha256 = hashlib.sha256(source_file.read_bytes()).hexdigest()
+    deployed_sha256 = hashlib.sha256(deployed_file.read_bytes()).hexdigest()
+    if source_sha256 != deployed_sha256:
+        raise OSError("CONTROL Lua 部署后哈希不一致，拒绝启动 capture PoC")
+    print("[部署] evolab_driver.lua sha256=%s verified=%s" % (
+        source_sha256, deployed_sha256 == source_sha256))
     return dst
 
 

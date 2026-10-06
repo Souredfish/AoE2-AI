@@ -32,6 +32,7 @@ local CFG = {
 local RESULT_CAPTURE_SETTING = "Read-only result capture PoC"
 local RESULT_CAPTURE_PREFIX = "EVOLAB_RESULT_CAPTURE_V1:"
 local RESULT_CAPTURE_PIPE = "EvoLabResultCaptureV1"
+local RESULT_CAPTURE_MODULE_BUILD = "sour100-ipc-update-poll-v2"
 local capture_enabled = false
 local capture_ipc_started = { ok = false, error = "PoC not enabled" }
 local capture_match_id = nil
@@ -39,6 +40,8 @@ local capture_sequence = 0
 local capture_ready_logged = false
 local captured_game_speed_set = { ok = false, error = "PoC not enabled" }
 local captured_game_speed_readback = { ok = false, error = "PoC not enabled" }
+local capture_update_count = 0
+local capture_hello_count = 0
 
 local function capture_value(callback)
     local ok, value = pcall(callback)
@@ -121,6 +124,7 @@ local function start_capture_ipc_server(lifecycle_stage)
         error = start_error,
     }
     Log("EvoLab PoC IPC StartServer result: " .. ToJSON({
+        module_build = RESULT_CAPTURE_MODULE_BUILD,
         lifecycle_stage = lifecycle_stage,
         pipe = RESULT_CAPTURE_PIPE,
         call_ok = capture_ipc_started.call_ok,
@@ -137,6 +141,7 @@ function Load(playerId)
     end
     capture_enabled = Settings.GetBool(RESULT_CAPTURE_SETTING, false)
     Log("EvoLab PoC lifecycle Load: " .. ToJSON({
+        module_build = RESULT_CAPTURE_MODULE_BUILD,
         assigned_player_id = playerId,
         capture_enabled = capture_enabled,
         auto_drive = Settings.GetBool("AutoDrive", true),
@@ -190,6 +195,7 @@ end
 
 function Init()
     Log("EvoLab PoC lifecycle Init: " .. ToJSON({
+        module_build = RESULT_CAPTURE_MODULE_BUILD,
         assigned_player_id = GetAssignedPlayerId(),
         capture_enabled = capture_enabled,
     }))
@@ -213,6 +219,14 @@ function Update()
     if not capture_enabled or not capture_ipc_started.ok then
         return
     end
+    capture_update_count = capture_update_count + 1
+    if capture_update_count == 1 then
+        Log("EvoLab PoC IPC Update polling started: " .. ToJSON({
+            module_build = RESULT_CAPTURE_MODULE_BUILD,
+            update_count = capture_update_count,
+            server_started = capture_ipc_started.ok,
+        }))
+    end
     local ok, messages = pcall(function() return IPC.GetMessages() end)
     if not ok or type(messages) ~= "table" then
         Log("EvoLab PoC IPC GetMessages failed: " .. tostring(messages))
@@ -222,16 +236,27 @@ function Update()
         local parsed = ParseJSON(raw)
         if type(parsed) == "table" and parsed.action == "capture_hello"
             and parsed.protocol_version == 1 then
+            capture_hello_count = capture_hello_count + 1
             local ready_ok, queued = pcall(function()
-                return IPC.Send({ action = "capture_ready", protocol_version = 1 })
+                return IPC.Send({ action = "capture_ready", protocol_version = 1,
+                    module_build = RESULT_CAPTURE_MODULE_BUILD })
             end)
             if ready_ok and queued == true then
-                if not capture_ready_logged then
-                    Log("EvoLab PoC IPC capture_ready queued after client hello")
+                if not capture_ready_logged or capture_hello_count % 10 == 0 then
+                    Log("EvoLab PoC IPC capture_ready queued after client hello: " .. ToJSON({
+                        module_build = RESULT_CAPTURE_MODULE_BUILD,
+                        hello_count = capture_hello_count,
+                        update_count = capture_update_count,
+                    }))
                     capture_ready_logged = true
                 end
             else
-                Log("EvoLab PoC IPC capture_ready send failed: " .. tostring(queued))
+                Log("EvoLab PoC IPC capture_ready send failed: " .. ToJSON({
+                    module_build = RESULT_CAPTURE_MODULE_BUILD,
+                    hello_count = capture_hello_count,
+                    update_count = capture_update_count,
+                    error = tostring(queued),
+                }))
             end
         elseif type(parsed) == "table" and parsed.action == "bind_match"
             and type(parsed.match_id) == "string" and parsed.match_id ~= ""

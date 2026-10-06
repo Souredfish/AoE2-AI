@@ -13,7 +13,7 @@ from ai_lab.result_capture_ipc import (CaptureIPCRejected, append_capture_associ
                                        load_raw_capture, parse_ipc_envelope,
                                        WindowsPipeCaptureReceiver, _binding_request,
                                        _capture_hello_request, _is_capture_ready,
-                                       _send_capture_hellos)
+                                       _send_capture_hellos, CAPTURE_MODULE_BUILD)
 
 
 def envelope(payload=None, source=None):
@@ -113,9 +113,13 @@ class ResultCaptureIPCTests(unittest.TestCase):
             _binding_request("")
 
     def test_server_ready_requires_supported_handshake_version(self):
-        ready = envelope({"action": "capture_ready", "protocol_version": 1})
+        ready = envelope({"action": "capture_ready", "protocol_version": 1,
+                          "module_build": CAPTURE_MODULE_BUILD})
         self.assertTrue(_is_capture_ready(ready))
         ready["payload"]["protocol_version"] = 2
+        self.assertFalse(_is_capture_ready(ready))
+        ready["payload"]["protocol_version"] = 1
+        ready["payload"]["module_build"] = "stale-loaded-module"
         self.assertFalse(_is_capture_ready(ready))
 
     def test_client_repeats_hello_until_server_ready(self):
@@ -151,10 +155,16 @@ class ResultCaptureIPCTests(unittest.TestCase):
                   "evolab_driver.main.lua").read_text(encoding="utf-8")
         for marker in (
                 "lifecycle Load", "lifecycle Init", "IPC StartServer result",
-                "capture_ready queued after client hello", "binding acknowledgement failed",
+                "Update polling started", "capture_ready queued after client hello",
+                "module_build", "binding acknowledgement failed",
                 "runner match_id bound", 'start_capture_ipc_server("Load")'):
             with self.subTest(marker=marker):
                 self.assertIn(marker, source)
+        update_body = source.split("function Update()", 1)[1].split("\nfunction End(", 1)[0]
+        self.assertIn("IPC.GetMessages()", update_body)
+        self.assertIn("capture_ready", update_body)
+        init_body = source.split("function Init()", 1)[1].split("\nfunction Update(", 1)[0]
+        self.assertNotIn("IPC.GetMessages()", init_body)
 
     def test_pipe_handshake_connect_ready_bind_ack_sequence(self):
         responses = queue.Queue()
@@ -173,7 +183,8 @@ class ResultCaptureIPCTests(unittest.TestCase):
             written.append(message)
             action = message["payload"]["action"]
             if action == "capture_hello":
-                payload = {"action": "capture_ready", "protocol_version": 1}
+                payload = {"action": "capture_ready", "protocol_version": 1,
+                           "module_build": CAPTURE_MODULE_BUILD}
             else:
                 payload = {"action": "match_bound", "match_id": "g0-m0001"}
             responses.put(json.dumps({
@@ -217,6 +228,45 @@ class ResultCaptureIPCTests(unittest.TestCase):
         self.assertLess(stages.index("pipe_connected"), stages.index("capture_ready_received"))
         self.assertLess(stages.index("capture_ready_received"), stages.index("bind_match_sent"))
         self.assertLess(stages.index("bind_match_sent"), stages.index("match_bound_received"))
+
+    def test_stale_module_ready_is_rejected_before_binding(self):
+        events = []
+        receiver = WindowsPipeCaptureReceiver(
+            "unused.jsonl", "g0-m0001", diagnostic=events.append)
+        stale_ready = json.dumps(envelope({
+            "action": "capture_ready", "protocol_version": 1,
+            "module_build": "stale-loaded-module",
+        })).encode("utf-8")
+
+        class FakePipeError(Exception):
+            def __init__(self, winerror):
+                super().__init__(winerror)
+                self.winerror = winerror
+
+        fake_file = SimpleNamespace(
+            GENERIC_READ=1, GENERIC_WRITE=2, OPEN_EXISTING=3,
+            CreateFile=lambda *_args: "fake-pipe",
+            WriteFile=lambda *_args: (0, len(_args[-1])),
+            ReadFile=lambda *_args: (0, stale_ready),
+            CloseHandle=lambda _handle: None,
+        )
+        fake_pipe = SimpleNamespace(
+            PIPE_READMODE_MESSAGE=1,
+            SetNamedPipeHandleState=lambda *_args: None,
+        )
+        fake_winerror = SimpleNamespace(error=FakePipeError)
+        with patch.dict(sys.modules, {
+                "pywintypes": fake_winerror,
+                "win32file": fake_file,
+                "win32pipe": fake_pipe,
+        }):
+            receiver._receive()
+            receiver.stop()
+
+        self.assertIsInstance(receiver._error, CaptureIPCRejected)
+        self.assertIn("模块构建标识不匹配", str(receiver._error))
+        self.assertFalse(receiver._binding_sent)
+        self.assertIn("capture_ready_rejected", [event["stage"] for event in events])
 
     def test_missing_server_reports_connect_timeout(self):
         events = []

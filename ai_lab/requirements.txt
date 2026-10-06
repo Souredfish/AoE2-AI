@@ -1,1 +1,3 @@
-mgz>=1.0
+# Upstream support for AoE2 DE save_version 68 is not in the PyPI release yet.
+# Keep the pin at the upstream compatibility fix; older replay formats are gated.
+mgz @ git+https://github.com/happyleavesaoc/aoc-mgz.git@c8e02cb9d5f1e3ea8303810bcae7270c77a56046

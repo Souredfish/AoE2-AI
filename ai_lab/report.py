@@ -16,6 +16,11 @@ import sys
 import time
 from pathlib import Path
 
+try:
+    from .recordings import latest_recording, recording_directories
+except ImportError:  # Script execution from ai_lab/ on Windows.
+    from recordings import latest_recording, recording_directories
+
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -25,13 +30,11 @@ def load_config():
 
 
 def find_latest_record(cfg):
-    rec_dir = Path(cfg["game"]["recordings_dir"])
-    if not rec_dir.exists():
-        sys.exit("录像目录不存在: %s" % rec_dir)
-    records = sorted(rec_dir.glob("*.aoe2record"), key=lambda p: p.stat().st_mtime)
-    if not records:
-        sys.exit("录像目录里没有对局录像，先打一局吧。目录: %s" % rec_dir)
-    return records[-1]
+    record = latest_recording(cfg)
+    if record is None:
+        dirs = ", ".join(str(p) for p in recording_directories(cfg))
+        sys.exit("没有找到 .aoe2record 录像。已检查目录: %s；请核对 config.json 的 game.recordings_dir" % (dirs or "未配置"))
+    return record
 
 
 def parse_record(path):
@@ -73,7 +76,7 @@ def parse_record(path):
                 entry["winner"] = bool(p["winner"])
             players.append(entry)
     except Exception as e:
-        print("[警告] 玩家解析失败: %s" % e)
+        raise ValueError("mgz 无法解析录像玩家信息；请确认 mgz 版本支持该游戏 build。原始错误: %s" % e) from e
 
     info["players"] = players
 

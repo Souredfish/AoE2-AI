@@ -37,6 +37,7 @@ import genome as G  # noqa: E402
 import make_ai as MK  # noqa: E402
 import report as RPT  # noqa: E402
 import evolve as EV  # noqa: E402
+import recordings as REC  # noqa: E402
 
 LAB = ROOT / "lab_data"
 CONTROL_CFG = Path.home().parent.parent / "AppData/Roaming"  # %APPDATA%
@@ -139,14 +140,7 @@ def ensure_control(cfg, max_wait_s=600):
 # 对局结果
 # ------------------------------------------------------------------
 def list_recordings(cfg):
-    rec_dir = Path(cfg["game"]["recordings_dir"])
-    dirs = [rec_dir, rec_dir.parent]  # 单人录像有时落在 savegame 根目录
-    seen = {}
-    for d in dirs:
-        if d.exists():
-            for p in d.glob("*.aoe2record"):
-                seen[str(p)] = p
-    return seen
+    return REC.list_recordings(cfg)
 
 
 def wait_new_recording(cfg, before, timeout_min):

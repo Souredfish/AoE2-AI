@@ -8,6 +8,8 @@ from ai_lab import auto_runner
 
 
 class WindowReadinessTests(unittest.TestCase):
+    GAME_EXE = r"C:\Steam\steamapps\common\AoE2DE\AoE2DE_s.exe"
+
     def _window(self, hwnd=1, visible=True, minimized=False, width=1382, height=807):
         return {
             "hwnd": hwnd,
@@ -16,6 +18,20 @@ class WindowReadinessTests(unittest.TestCase):
             "visible": visible, "minimized": minimized,
             "width": width, "height": height,
         }
+
+    def _steam_processes(self):
+        return [
+            {"Name": "steam.exe", "ProcessId": 10, "ParentProcessId": 1,
+             "ExecutablePath": r"C:\Steam\steam.exe"},
+            {"Name": "AoE2DE_s.exe", "ProcessId": 20, "ParentProcessId": 10,
+             "ExecutablePath": self.GAME_EXE},
+        ]
+
+    def _cfg(self, launcher):
+        return {"control": {"launcher": str(launcher)}, "game": {
+            "install_dir": r"C:\Steam\steamapps\common\AoE2DE",
+            "exe": "AoE2DE_s.exe",
+        }}
 
     def test_game_window_gate_ignores_directshow_helper_windows(self):
         main = self._window()
@@ -83,15 +99,14 @@ class WindowReadinessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             launcher = Path(temp) / "launcher.exe"
             launcher.touch()
-            cfg = {"control": {"launcher": str(launcher)}}
+            cfg = self._cfg(launcher)
             probe = iter([(False, "最小化"), (True, "ready")])
             runner = unittest.mock.Mock(return_value=SimpleNamespace(returncode=0, stdout="Ready"))
             sleeps = []
-            with patch.object(auto_runner, "game_running", return_value=True):
-                result = auto_runner.ensure_control(
-                    cfg, max_wait_s=10, window_probe=lambda: next(probe),
-                    control_runner=runner, monotonic=lambda: 1,
-                    sleep=sleeps.append)
+            result = auto_runner.ensure_control(
+                cfg, max_wait_s=10, window_probe=lambda pids: next(probe),
+                control_runner=runner, monotonic=lambda: 1,
+                sleep=sleeps.append, process_probe=self._steam_processes)
             self.assertTrue(result)
             self.assertEqual(runner.call_count, 1)
             self.assertEqual(sleeps, [2])
@@ -114,14 +129,13 @@ class WindowReadinessTests(unittest.TestCase):
             with self.subTest(stdout=stdout), tempfile.TemporaryDirectory() as temp:
                 launcher = Path(temp) / "launcher.exe"
                 launcher.touch()
-                cfg = {"control": {"launcher": str(launcher)}}
+                cfg = self._cfg(launcher)
                 runner = unittest.mock.Mock(
                     return_value=SimpleNamespace(returncode=0, stdout=stdout))
-                with patch.object(auto_runner, "game_running", return_value=True):
-                    result = auto_runner.ensure_control(
-                        cfg, max_wait_s=10, window_probe=lambda: (True, "ready"),
-                        control_runner=runner, monotonic=lambda: 1,
-                        sleep=lambda _: None)
+                result = auto_runner.ensure_control(
+                    cfg, max_wait_s=10, window_probe=lambda pids: (True, "ready"),
+                    control_runner=runner, monotonic=lambda: 1,
+                    sleep=lambda _: None, process_probe=self._steam_processes)
                 self.assertFalse(result)
                 self.assertEqual(runner.call_count, 1)
 
@@ -129,15 +143,57 @@ class WindowReadinessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             launcher = Path(temp) / "launcher.exe"
             launcher.touch()
-            cfg = {"control": {"launcher": str(launcher)}}
+            cfg = self._cfg(launcher)
             runner = unittest.mock.Mock(return_value=SimpleNamespace(returncode=7, stdout="not ready"))
             ticks = iter([0, 0, 1, 1, 3, 3, 5, 5])
-            with patch.object(auto_runner, "game_running", return_value=True):
-                result = auto_runner.ensure_control(
-                    cfg, max_wait_s=4, window_probe=lambda: (True, "ready"),
-                    control_runner=runner, monotonic=lambda: next(ticks), sleep=lambda _: None)
+            result = auto_runner.ensure_control(
+                cfg, max_wait_s=4, window_probe=lambda pids: (True, "ready"),
+                control_runner=runner, monotonic=lambda: next(ticks), sleep=lambda _: None,
+                process_probe=self._steam_processes)
             self.assertFalse(result)
             self.assertGreater(runner.call_count, 0)
+
+    def test_only_steam_started_process_at_configured_path_is_accepted(self):
+        processes = self._steam_processes() + [
+            {"Name": "AoE2DE_s.exe", "ProcessId": 30, "ParentProcessId": 999,
+             "ExecutablePath": self.GAME_EXE},
+            {"Name": "AoE2DE_s.exe", "ProcessId": 40, "ParentProcessId": 10,
+             "ExecutablePath": r"C:\Other\AoE2DE_s.exe"},
+        ]
+        self.assertEqual(auto_runner.steam_launched_game_pids(
+            processes, self.GAME_EXE), {20})
+
+    def test_runner_ignores_direct_transient_and_waits_for_steam_game_pid(self):
+        with tempfile.TemporaryDirectory() as temp:
+            launcher = Path(temp) / "launcher.exe"
+            launcher.touch()
+            cfg = self._cfg(launcher)
+            direct = [{"Name": "AoE2DE_s.exe", "ProcessId": 30, "ParentProcessId": 999,
+                       "ExecutablePath": self.GAME_EXE}]
+            steam_game = self._steam_processes()
+            snapshots = iter([direct, direct + steam_game, direct + steam_game])
+            seen_pids = []
+            runner = unittest.mock.Mock(
+                return_value=SimpleNamespace(returncode=0, stdout="Ready"))
+            launch = unittest.mock.Mock()
+            ready = auto_runner.ensure_control(
+                cfg, max_wait_s=10,
+                window_probe=lambda pids: (seen_pids.append(set(pids)) or (True, "ready")),
+                control_runner=runner, monotonic=lambda: 1, sleep=lambda _: None,
+                process_probe=lambda: next(snapshots), game_launcher=launch)
+            self.assertTrue(ready)
+            launch.assert_called_once_with(cfg)
+            self.assertEqual(seen_pids, [{20}])
+
+    def test_steam_launcher_uses_app_id_without_skipintro(self):
+        cfg = {"game": {"install_dir": r"C:\Steam\steamapps\common\AoE2DE",
+                        "exe": "AoE2DE_s.exe"}}
+        steam_exe = Path("C:/Steam/steam.exe")
+        with patch.object(auto_runner, "resolve_steam_exe", return_value=steam_exe), \
+                patch.object(auto_runner.subprocess, "Popen") as popen:
+            auto_runner.start_game(cfg)
+        popen.assert_called_once_with(
+            [str(steam_exe), "-applaunch", "813780"], cwd=str(steam_exe.parent))
 
 
 if __name__ == "__main__":

@@ -22,11 +22,10 @@ auto_runner.py — 全自动跑局（AoE2Control 驱动）
 """
 
 import argparse
-import csv
 import hashlib
-import io
 import json
 import math
+import ntpath
 import os
 import random
 import re
@@ -90,20 +89,99 @@ def check_module_assigned():
 # ------------------------------------------------------------------
 # 游戏与 CONTROL 生命周期
 # ------------------------------------------------------------------
-def game_running():
-    try:
-        out = subprocess.run(
-            ["tasklist", "/FI", "IMAGENAME eq AoE2DE_s.exe", "/NH"],
-            capture_output=True, text=True, timeout=15)
-        return "AoE2DE_s.exe" in out.stdout
-    except Exception:
-        return False
+STEAM_APP_ID = "813780"
+
+
+def resolve_steam_exe(cfg):
+    """Find Steam from config, the game library path, or its registry entry."""
+    game_cfg = cfg["game"]
+    explicit = game_cfg.get("steam_exe")
+    if explicit:
+        candidate = Path(explicit)
+        return candidate if candidate.is_file() else None
+    install_dir = Path(game_cfg["install_dir"])
+    for parent in (install_dir, *install_dir.parents):
+        candidate = parent / "steam.exe"
+        if candidate.is_file():
+            return candidate
+    if sys.platform == "win32":
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam") as key:
+                steam_path, _ = winreg.QueryValueEx(key, "SteamPath")
+            candidate = Path(steam_path) / "steam.exe"
+            return candidate if candidate.is_file() else None
+        except (OSError, ImportError):
+            pass
+    return None
 
 
 def start_game(cfg):
-    exe = Path(cfg["game"]["install_dir"]) / cfg["game"]["exe"]
-    print("[启动] 游戏主程序: %s" % exe)
-    subprocess.Popen([str(exe)], cwd=str(exe.parent))
+    """Start AoE2 using Steam's app launcher, without extra launch options."""
+    steam_exe = resolve_steam_exe(cfg)
+    if steam_exe is None:
+        raise FileNotFoundError("未找到 Steam 客户端；请配置 game.steam_exe")
+    app_id = str(cfg["game"].get("steam_app_id", STEAM_APP_ID))
+    if app_id != STEAM_APP_ID:
+        raise ValueError("AoE2 DE Steam App ID 不匹配: %s" % app_id)
+    print("[启动] 通过 Steam -applaunch %s 启动游戏" % app_id)
+    return subprocess.Popen([str(steam_exe), "-applaunch", app_id], cwd=str(steam_exe.parent))
+
+
+def game_process_snapshot():
+    """Read process ancestry so a transient direct game launch cannot pass readiness."""
+    if sys.platform != "win32":
+        raise OSError("Steam 启动进程探测仅支持 Windows")
+    command = (
+        "Get-CimInstance Win32_Process | Where-Object { "
+        "$_.Name -in @('AoE2DE_s.exe','steam.exe') } | "
+        "Select-Object Name,ProcessId,ParentProcessId,ExecutablePath | ConvertTo-Json -Compress"
+    )
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=20)
+    if result.returncode != 0:
+        raise OSError("无法读取 Steam/游戏进程关系: %s" % (result.stderr or result.stdout))
+    try:
+        raw = json.loads(result.stdout or "[]")
+    except json.JSONDecodeError as exc:
+        raise OSError("Steam/游戏进程探测返回无效 JSON") from exc
+    return raw if isinstance(raw, list) else [raw]
+
+
+def steam_launched_game_pids(processes, game_exe):
+    """Select game processes matching the configured binary with a Steam ancestor."""
+    by_pid = {}
+    for proc in processes:
+        try:
+            by_pid[int(proc["ProcessId"])] = proc
+        except (KeyError, TypeError, ValueError):
+            continue
+    expected_path = ntpath.normcase(ntpath.normpath(str(game_exe)))
+    steam_pids = {pid for pid, proc in by_pid.items()
+                  if str(proc.get("Name", "")).lower() == "steam.exe"}
+    result = set()
+    for pid, proc in by_pid.items():
+        if str(proc.get("Name", "")).lower() != "aoe2de_s.exe":
+            continue
+        actual_path = ntpath.normcase(ntpath.normpath(str(proc.get("ExecutablePath") or "")))
+        if actual_path != expected_path:
+            continue
+        seen = set()
+        parent = proc.get("ParentProcessId")
+        while parent is not None:
+            try:
+                parent = int(parent)
+            except (TypeError, ValueError):
+                break
+            if parent in steam_pids:
+                result.add(pid)
+                break
+            if parent in seen or parent not in by_pid:
+                break
+            seen.add(parent)
+            parent = by_pid[parent].get("ParentProcessId")
+    return result
 
 
 WINDOW_MIN_WIDTH = 640
@@ -154,7 +232,7 @@ def control_terminal_status(stdout):
     return status if status in CONTROL_SUCCESS_STATUSES else None
 
 
-def game_window_status():
+def game_window_status(game_pids=None):
     """Check that one visible, restored AoE2 main window is ready on Windows."""
     if sys.platform != "win32":
         return False, "窗口状态探测仅支持 Windows"
@@ -162,16 +240,11 @@ def game_window_status():
         import ctypes
         from ctypes import wintypes
 
-        tasklist = subprocess.run(
-            ["tasklist", "/FI", "IMAGENAME eq AoE2DE_s.exe", "/FO", "CSV", "/NH"],
-            capture_output=True, text=True, timeout=15)
-        pids = set()
-        for row in csv.reader(io.StringIO(tasklist.stdout or "")):
-            if len(row) >= 2 and row[0].lower() == "aoe2de_s.exe":
-                try:
-                    pids.add(int(row[1]))
-                except ValueError:
-                    pass
+        if game_pids is None:
+            game_cfg = load_config()["game"]
+            game_exe = Path(game_cfg["install_dir"]) / game_cfg["exe"]
+            game_pids = steam_launched_game_pids(game_process_snapshot(), game_exe)
+        pids = set(game_pids)
         if not pids:
             return False, "未找到 AoE2DE_s.exe 进程"
 
@@ -219,7 +292,8 @@ def wait_for_game_window(timeout_s, window_probe=game_window_status,
 
 
 def ensure_control(cfg, max_wait_s=600, window_probe=game_window_status,
-                   control_runner=subprocess.run, monotonic=time.monotonic, sleep=time.sleep):
+                   control_runner=subprocess.run, monotonic=time.monotonic, sleep=time.sleep,
+                   process_probe=game_process_snapshot, game_launcher=start_game):
     """确保游戏运行且 CONTROL 就绪。返回 True/False。"""
     launcher = Path(cfg["control"]["launcher"])
     if not launcher.is_absolute():
@@ -229,17 +303,37 @@ def ensure_control(cfg, max_wait_s=600, window_probe=game_window_status,
         print("[错误] 找不到 AoE2Control 启动器: %s" % launcher)
         return False
 
-    if not game_running():
-        start_game(cfg)
-        print("[等待] 游戏启动中（首次启动可能需要 1~2 分钟）...")
+    game_exe = Path(cfg["game"]["install_dir"]) / cfg["game"]["exe"]
+    try:
+        existing_pids = steam_launched_game_pids(process_probe(), game_exe)
+    except (OSError, ValueError) as exc:
+        print("[错误] 无法确认 Steam 启动的游戏进程: %s" % exc)
+        return False
+    if not existing_pids:
+        try:
+            launch_process = game_launcher(cfg)
+        except (OSError, ValueError) as exc:
+            print("[错误] Steam 启动失败: %s" % exc)
+            return False
+        launch_pid = getattr(launch_process, "pid", None)
+        print("[等待] Steam launcher_pid=%s；等待 Steam 启动最终游戏进程（有界）..." %
+              (launch_pid if launch_pid is not None else "unknown"))
 
     deadline = monotonic() + max_wait_s
     last_window_reason = "未检测"
     while monotonic() < deadline:
-        if not game_running():
-            sleep(min(10, max(0, deadline - monotonic())))
+        try:
+            game_pids = steam_launched_game_pids(process_probe(), game_exe)
+        except (OSError, ValueError) as exc:
+            print("[错误] Steam/游戏进程探测失败: %s" % exc)
+            return False
+        print("[Steam进程探测] 候选最终游戏 PID=%s" % sorted(game_pids))
+        if not game_pids:
+            sleep(min(2, max(0, deadline - monotonic())))
             continue
-        ready, last_window_reason = window_probe()
+        ready, last_window_reason = window_probe(game_pids)
+        print("[窗口就绪探测] pids=%s ready=%s reason=%s" % (
+            sorted(game_pids), ready, last_window_reason))
         if not ready:
             sleep(min(2, max(0, deadline - monotonic())))
             continue

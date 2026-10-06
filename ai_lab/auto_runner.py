@@ -103,6 +103,25 @@ def start_game(cfg):
 WINDOW_MIN_WIDTH = 640
 WINDOW_MIN_HEIGHT = 360
 
+# AoE2Control documents these as terminal statuses with exit code 0.
+# Do not infer readiness from the exit code alone: unknown or empty output
+# may indicate an incompatible launcher or an incomplete startup.
+CONTROL_SUCCESS_STATUSES = {
+    "Ready",
+    "Ready - Partially outdated",
+    "Ready - Requires update",
+    "Already Running!",
+}
+
+
+def control_terminal_status(stdout):
+    """Return the documented Headless terminal status, or None if unknown."""
+    lines = [line.strip() for line in (stdout or "").splitlines() if line.strip()]
+    if not lines:
+        return None
+    status = lines[-1]
+    return status if status in CONTROL_SUCCESS_STATUSES else None
+
 
 def game_window_status():
     """Return (ready, reason) for a visible, restored AoE2 game window."""
@@ -201,7 +220,12 @@ def ensure_control(cfg, max_wait_s=600, window_probe=game_window_status,
         last = [l for l in out.splitlines() if l.strip()]
         print("[CONTROL] %s (exit=%d)" % (last[-1] if last else "无输出", proc.returncode))
         if proc.returncode == 0:
-            return True
+            status = control_terminal_status(out)
+            if status is not None:
+                return True
+            print("[错误] CONTROL 返回 exit 0，但没有可识别的成功状态（末行：%s）" %
+                  (last[-1].strip() if last else "无输出"))
+            return False
         if proc.returncode in (6, 7):
             last_window_reason = "Headless exit %d: %s" % (
                 proc.returncode, last[-1] if last else "无输出")

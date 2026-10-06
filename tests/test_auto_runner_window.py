@@ -53,6 +53,35 @@ class WindowReadinessTests(unittest.TestCase):
             self.assertEqual(runner.call_count, 1)
             self.assertEqual(sleeps, [2])
 
+    def test_documented_headless_success_statuses_are_recognized(self):
+        for status in auto_runner.CONTROL_SUCCESS_STATUSES:
+            with self.subTest(status=status):
+                self.assertEqual(
+                    auto_runner.control_terminal_status("v1.1.0\nScanning...\n" + status),
+                    status,
+                )
+
+    def test_unknown_or_missing_headless_status_is_not_recognized(self):
+        for stdout in ("v1.1.0\nScanning...\nUnexpected", "", "\n  "):
+            with self.subTest(stdout=stdout):
+                self.assertIsNone(auto_runner.control_terminal_status(stdout))
+
+    def test_exit_zero_without_documented_success_status_is_rejected(self):
+        for stdout in ("v1.1.0\nScanning...\nUnexpected", ""):
+            with self.subTest(stdout=stdout), tempfile.TemporaryDirectory() as temp:
+                launcher = Path(temp) / "launcher.exe"
+                launcher.touch()
+                cfg = {"control": {"launcher": str(launcher)}}
+                runner = unittest.mock.Mock(
+                    return_value=SimpleNamespace(returncode=0, stdout=stdout))
+                with patch.object(auto_runner, "game_running", return_value=True):
+                    result = auto_runner.ensure_control(
+                        cfg, max_wait_s=10, window_probe=lambda: (True, "ready"),
+                        control_runner=runner, monotonic=lambda: 1,
+                        sleep=lambda _: None)
+                self.assertFalse(result)
+                self.assertEqual(runner.call_count, 1)
+
     def test_headless_exit_seven_never_counts_as_success(self):
         with tempfile.TemporaryDirectory() as temp:
             launcher = Path(temp) / "launcher.exe"

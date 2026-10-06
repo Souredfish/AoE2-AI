@@ -17,7 +17,7 @@ from pathlib import Path
 PIPE_NAME = "EvoLabResultCaptureV1"
 PIPE_PATH = "\\\\.\\pipe\\" + PIPE_NAME
 CAPTURE_PREFIX = "EVOLAB_RESULT_CAPTURE_V1:"
-CAPTURE_MODULE_BUILD = "sour100-ipc-update-poll-v2"
+CAPTURE_MODULE_BUILD = "sour100-ipc-wait-message-v3"
 _MATCH_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 

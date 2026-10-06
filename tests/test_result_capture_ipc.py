@@ -157,13 +157,25 @@ class ResultCaptureIPCTests(unittest.TestCase):
                 "lifecycle Load", "lifecycle Init", "IPC StartServer result",
                 "Update polling started", "capture_ready queued after client hello",
                 "module_build", "capture_update_heartbeat", "IPC.GetStats()",
-                "binding acknowledgement failed",
+                "IPC.HasMessages()", "IPC.WaitForMessage(1)",
+                "IPC.WaitForMessage failed", "binding acknowledgement failed",
                 "runner match_id bound", 'start_capture_ipc_server("Load")'):
             with self.subTest(marker=marker):
                 self.assertIn(marker, source)
+        receive_body = source.split("local function receive_capture_ipc_messages()", 1)[1].split(
+            "\nlocal function start_capture_ipc_server", 1)[0]
+        self.assertIn("pcall(function() return IPC.HasMessages() end)", receive_body)
+        self.assertIn("pcall(function() return IPC.WaitForMessage(1) end)", receive_body)
+        self.assertIn('type(raw) ~= "string"', receive_body)
+        self.assertIn("received < 32", receive_body)
+        self.assertIn("return nil, \"IPC.WaitForMessage failed:", receive_body)
         update_body = source.split("function Update()", 1)[1].split("\nfunction End(", 1)[0]
-        self.assertIn("IPC.GetMessages()", update_body)
+        self.assertNotIn("IPC.GetMessages()", source)
         self.assertIn("capture_ready", update_body)
+        self.assertIn("receive_capture_ipc_messages()", update_body)
+        self.assertIn("messages = {}", update_body)
+        self.assertLess(update_body.index("if receive_error ~= nil"),
+                        update_body.index('parsed.action == "capture_hello"'))
         init_body = source.split("function Init()", 1)[1].split("\nfunction Update(", 1)[0]
         self.assertNotIn("IPC.GetMessages()", init_body)
 

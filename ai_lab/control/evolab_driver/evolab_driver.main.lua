@@ -32,7 +32,7 @@ local CFG = {
 local RESULT_CAPTURE_SETTING = "Read-only result capture PoC"
 local RESULT_CAPTURE_PREFIX = "EVOLAB_RESULT_CAPTURE_V1:"
 local RESULT_CAPTURE_PIPE = "EvoLabResultCaptureV1"
-local RESULT_CAPTURE_MODULE_BUILD = "sour100-ipc-update-poll-v2"
+local RESULT_CAPTURE_MODULE_BUILD = "sour100-ipc-wait-message-v3"
 local capture_enabled = false
 local capture_ipc_started = { ok = false, error = "PoC not enabled" }
 local capture_match_id = nil
@@ -42,6 +42,7 @@ local captured_game_speed_set = { ok = false, error = "PoC not enabled" }
 local captured_game_speed_readback = { ok = false, error = "PoC not enabled" }
 local capture_update_count = 0
 local capture_hello_count = 0
+local capture_receive_error_count = 0
 
 local function capture_value(callback)
     local ok, value = pcall(callback)
@@ -103,6 +104,41 @@ local function capture_victory_player()
         player_id_raw = id,
         player_name_raw = name,
     }
+end
+
+local function receive_capture_ipc_messages()
+    local messages = {}
+    local has_ok, has_messages = pcall(function() return IPC.HasMessages() end)
+    if not has_ok then
+        return nil, "IPC.HasMessages failed: " .. tostring(has_messages)
+    end
+    if type(has_messages) ~= "boolean" then
+        return nil, "IPC.HasMessages returned " .. type(has_messages)
+    end
+
+    local received = 0
+    while has_messages and received < 32 do
+        -- GetMessages() returns vector<string>; CONTROL 1.1.0's sol binding
+        -- throws while converting that vector. WaitForMessage returns one string.
+        local wait_ok, raw = pcall(function() return IPC.WaitForMessage(1) end)
+        if not wait_ok then
+            return nil, "IPC.WaitForMessage failed: " .. tostring(raw)
+        end
+        if type(raw) ~= "string" then
+            return nil, "IPC.WaitForMessage returned " .. type(raw)
+        end
+        messages[#messages + 1] = raw
+        received = received + 1
+
+        has_ok, has_messages = pcall(function() return IPC.HasMessages() end)
+        if not has_ok then
+            return nil, "IPC.HasMessages failed after receive: " .. tostring(has_messages)
+        end
+        if type(has_messages) ~= "boolean" then
+            return nil, "IPC.HasMessages returned " .. type(has_messages)
+        end
+    end
+    return messages, nil
 end
 
 local function start_capture_ipc_server(lifecycle_stage)
@@ -223,14 +259,24 @@ function Update()
     if capture_update_count == 1 then
         Log("EvoLab PoC IPC Update polling started: " .. ToJSON({
             module_build = RESULT_CAPTURE_MODULE_BUILD,
+            receive_mode = "HasMessages+WaitForMessage(1)",
+            message_batch_limit = 32,
             update_count = capture_update_count,
             server_started = capture_ipc_started.ok,
         }))
     end
-    local ok, messages = pcall(function() return IPC.GetMessages() end)
-    if not ok or type(messages) ~= "table" then
-        Log("EvoLab PoC IPC GetMessages failed: " .. tostring(messages))
-        return
+    local messages, receive_error = receive_capture_ipc_messages()
+    if receive_error ~= nil then
+        capture_receive_error_count = capture_receive_error_count + 1
+        if capture_receive_error_count == 1 or capture_receive_error_count % 60 == 0 then
+            Log("EvoLab PoC IPC receive failed: " .. ToJSON({
+                module_build = RESULT_CAPTURE_MODULE_BUILD,
+                receive_mode = "HasMessages+WaitForMessage(1)",
+                receive_error_count = capture_receive_error_count,
+                error = receive_error,
+            }))
+        end
+        messages = {}
     end
     for _, raw in ipairs(messages) do
         local parsed = ParseJSON(raw)

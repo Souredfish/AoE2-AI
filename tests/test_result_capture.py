@@ -11,6 +11,7 @@ def observation():
     return {
         "schema_version": 1,
         "capture_sequence": 1,
+        "match_id": "g0-m0001",
         "game_time_seconds": {"ok": True, "value_type": "number", "value": 385.0},
         "game_speed_set": {"call_ok": True, "return_value": {"ok": True, "value_type": "nil"}},
         "game_speed_readback": {"ok": True, "value_type": "number", "value": 2.0},
@@ -95,6 +96,12 @@ class ResultCaptureTests(unittest.TestCase):
         raw = observation()
         raw["capture_sequence"] = 2
         with self.assertRaisesRegex(CaptureRejected, "首次调用"):
+            validate_capture(raw, context())
+
+    def test_sentinel_match_id_must_match_runner_context(self):
+        raw = observation()
+        raw["match_id"] = "g0-m0002"
+        with self.assertRaisesRegex(CaptureRejected, "match_id"):
             validate_capture(raw, context())
 
     def test_failed_speed_set_call_is_rejected(self):

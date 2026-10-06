@@ -13,6 +13,11 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+try:  # package import in tests; script import when launched from auto_runner.py
+    from .result_capture_ipc import CaptureIPCRejected, load_raw_capture
+except ImportError:
+    from result_capture_ipc import CaptureIPCRejected, load_raw_capture
+
 
 CAPTURE_PREFIX = "EVOLAB_RESULT_CAPTURE_V1:"
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -145,6 +150,8 @@ def validate_capture(raw, context):
         datetime.fromisoformat(context["captured_at_utc"].replace("Z", "+00:00"))
     except ValueError as exc:
         raise CaptureRejected("采集时间戳无效") from exc
+    if raw.get("match_id") != context["match_id"]:
+        raise CaptureRejected("sentinel match_id 与 runner 录像关联不一致")
 
     slots = context.get("slots_by_alias")
     installed = context.get("installed")
@@ -241,7 +248,8 @@ def append_capture(path, event):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Validate one read-only AoE2 result capture")
-    parser.add_argument("--observation", required=True, help="CONTROL log sentinel line or JSON payload")
+    parser.add_argument("--raw-capture", required=True,
+                        help="auto_runner 保存的原始 AoE2Control IPC JSONL")
     parser.add_argument("--runner-evidence", required=True, help="gen_N.jsonl from auto_runner")
     parser.add_argument("--recording", required=True, help="exact associated .aoe2record path")
     parser.add_argument("--game-version", required=True, help="AoE2DE_s.exe ProductVersion")
@@ -251,13 +259,24 @@ def main(argv=None):
     parser.add_argument("--output", default="lab_data/runner_evidence/result_capture_poc.jsonl")
     args = parser.parse_args(argv)
     try:
-        raw = parse_observation(Path(args.observation).read_text(encoding="utf-8"))
         ctx = context_from_runner_evidence(
             args.runner_evidence, args.recording, args.game_version, args.control_version,
             args.modules_see_everything_confirmed)
+        raw_row = load_raw_capture(args.raw_capture, ctx["match_id"], {
+            "match_id": ctx["match_id"],
+            "slots_by_alias": ctx["slots_by_alias"],
+            "installed": ctx["installed"],
+            "recording": ctx["recording"],
+        })
+        raw = parse_observation(raw_row["raw_sentinel"])
         event = validate_capture(raw, ctx)
+        event["raw_capture_source"] = {
+            "kind": raw_row["kind"],
+            "received_at_utc": raw_row["received_at_utc"],
+            "raw_sentinel_sha256": raw_row["raw_sentinel_sha256"],
+        }
         append_capture(args.output, event)
-    except (OSError, CaptureRejected) as exc:
+    except (OSError, CaptureRejected, CaptureIPCRejected) as exc:
         print("[PoC 拒绝] %s" % exc, file=sys.stderr)
         return 2
     print("[PoC 已保留] match_id=%s；只读 JSONL=%s；ledger_eligible=false" % (

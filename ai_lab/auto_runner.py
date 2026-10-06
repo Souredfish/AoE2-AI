@@ -42,6 +42,9 @@ import make_ai as MK  # noqa: E402
 import report as RPT  # noqa: E402
 import evolve as EV  # noqa: E402
 import recordings as REC  # noqa: E402
+from result_capture_ipc import (CaptureIPCRejected, WindowsPipeCaptureReceiver,
+                                append_capture_association, load_raw_capture,
+                                raw_capture_path)  # noqa: E402
 
 LAB = ROOT / "lab_data"
 CONTROL_CFG = Path.home().parent.parent / "AppData/Roaming"  # %APPDATA%
@@ -710,6 +713,23 @@ def main():
     print()
 
     timeout_min = int(cfg.get("control", {}).get("auto_match_timeout_min", 150))
+    capture_receiver = None
+    if args.capture_only:
+        raw_path = raw_capture_path(LAB / "runner_evidence", schedule[0]["match_id"])
+        capture_receiver = WindowsPipeCaptureReceiver(raw_path, schedule[0]["match_id"])
+        try:
+            capture_receiver.start()
+        except OSError as e:
+            sys.exit("[PoC 拒绝] 无法启动 AoE2Control IPC 采集器：%s" % e)
+        print("[PoC IPC] 等待 CONTROL named pipe；原始 sentinel 将只追加到 %s" % raw_path)
+        try:
+            bound = capture_receiver.wait_until_bound(20)
+        except CaptureIPCRejected as e:
+            capture_receiver.stop()
+            sys.exit("[PoC 拒绝] 无法绑定本场 match_id：%s" % e)
+        if not bound:
+            capture_receiver.stop()
+            sys.exit("[PoC 拒绝] 20 秒内未收到 CONTROL 对本场 match_id 的绑定确认")
     for idx, match in enumerate(schedule):
         a, b = [EV.ER.individual_from_name(n, gen, pop) for n in match["players"]]
         if a is None or b is None:
@@ -777,7 +797,7 @@ def main():
             break
         stat = rec.stat()
         record_id = EV.ER.match_id_for_recording(rec)
-        evidence["recording"] = {
+        recording_evidence = {
             "path": rec_path,
             "record_id": record_id,
             "size_bytes": stat.st_size,
@@ -785,6 +805,9 @@ def main():
             "new_since_snapshot": len(candidate_keys) == 1 and candidate_keys[0] == rec_key,
             "new_candidates": candidate_keys,
         }
+        if args.capture_only:
+            recording_evidence["sha256"] = _file_sha256(rec)
+        evidence["recording"] = recording_evidence
         append_runner_evidence(gen, {
             "event": "recording_associated", "match_id": match["match_id"],
             "association": evidence,
@@ -793,6 +816,27 @@ def main():
             match["match_id"], record_id, rec_path,
             evidence["recording"]["new_since_snapshot"], len(candidate_keys)))
         if not result_commits_enabled(args.capture_only):
+            try:
+                capture_receiver.wait_for_capture(10)
+                capture_receiver.stop()
+                capture_association = {
+                    "match_id": match["match_id"],
+                    "slots_by_alias": evidence["slots_by_alias"],
+                    "installed": evidence["installed"],
+                    "recording": {
+                        "path": rec_path,
+                        "record_id": record_id,
+                        "sha256": evidence["recording"]["sha256"],
+                    },
+                }
+                append_capture_association(raw_path, capture_association)
+                raw_row = load_raw_capture(
+                    raw_path, match["match_id"], capture_association)
+            except (CaptureIPCRejected, RuntimeError) as e:
+                print("[PoC 拒绝] 未能非交互取得唯一原始 IPC sentinel：%s；账本/fitness 未写入。" % e)
+                break
+            print("[PoC IPC] 已追加并校验原始 sentinel：%s sha256=%s" % (
+                raw_path, raw_row["raw_sentinel_sha256"]))
             print("[只读 PoC] 已保留 match_prepared/recording_associated 证据；跳过战报解析、结果账本与 fitness。")
             break
         try:
@@ -817,6 +861,8 @@ def main():
         print("[完成] 本次赛程全部跑完！")
         print("[下一步] python evolve.py next   # 汇总积分，进化出下一代")
         print("[停止]  记得在游戏里按 Shift → 关掉 Player1 的模块（或按 Delete 卸载 CONTROL）")
+    if capture_receiver is not None:
+        capture_receiver.stop()
 
 
 if __name__ == "__main__":

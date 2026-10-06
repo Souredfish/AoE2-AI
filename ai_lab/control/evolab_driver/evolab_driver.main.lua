@@ -31,7 +31,10 @@ local CFG = {
 
 local RESULT_CAPTURE_SETTING = "Read-only result capture PoC"
 local RESULT_CAPTURE_PREFIX = "EVOLAB_RESULT_CAPTURE_V1:"
+local RESULT_CAPTURE_PIPE = "EvoLabResultCaptureV1"
 local capture_enabled = false
+local capture_ipc_started = { ok = false, error = "PoC not enabled" }
+local capture_match_id = nil
 local capture_sequence = 0
 local captured_game_speed_set = { ok = false, error = "PoC not enabled" }
 local captured_game_speed_readback = { ok = false, error = "PoC not enabled" }
@@ -155,6 +158,14 @@ function Init()
     if GetAssignedPlayerId() ~= 1 then
         return
     end
+    if capture_enabled then
+        local ok, started = pcall(function() return IPC.StartServer(RESULT_CAPTURE_PIPE) end)
+        capture_ipc_started = {
+            ok = ok and started == true,
+            error = not ok and tostring(started) or (started and nil or "IPC.StartServer returned false"),
+        }
+        Log("EvoLab PoC IPC server: " .. ToJSON(capture_ipc_started))
+    end
     if CFG.spectate_mode ~= "eliminate" then
         return
     end
@@ -166,6 +177,28 @@ function Init()
         if ok then n = n + 1 end
     end
     Log("EvoLab: 观察模式，已移除己方对象 " .. tostring(n) .. " 个")
+end
+
+function Update()
+    if not capture_enabled or not capture_ipc_started.ok then
+        return
+    end
+    local ok, messages = pcall(function() return IPC.GetMessages() end)
+    if not ok or type(messages) ~= "table" then
+        return
+    end
+    for _, raw in ipairs(messages) do
+        local parsed = ParseJSON(raw)
+        if type(parsed) == "table" and parsed.action == "bind_match"
+            and type(parsed.match_id) == "string" and parsed.match_id ~= ""
+            and capture_match_id == nil then
+            capture_match_id = parsed.match_id
+            IPC.Send({ action = "match_bound", match_id = capture_match_id })
+            Log("EvoLab PoC runner match_id bound: " .. capture_match_id)
+        else
+            Log("EvoLab PoC IPC binding rejected")
+        end
+    end
 end
 
 function End(hasWon)
@@ -180,6 +213,7 @@ function End(hasWon)
         local observation = {
             schema_version = 1,
             capture_sequence = capture_sequence,
+            match_id = capture_match_id,
             callback_has_won = capture_value(function() return hasWon end),
             game_time_seconds = capture_value(GetGameTime),
             game_speed_set = captured_game_speed_set,
@@ -187,7 +221,15 @@ function End(hasWon)
             victory_player = capture_victory_player(),
             players = { capture_player(2), capture_player(3) },
         }
-        Log(RESULT_CAPTURE_PREFIX .. ToJSON(observation))
+        local raw_sentinel = RESULT_CAPTURE_PREFIX .. ToJSON(observation)
+        Log(raw_sentinel)
+        if capture_ipc_started.ok then
+            local sent_ok, queued = pcall(function() return IPC.Send(raw_sentinel) end)
+            Log("EvoLab PoC IPC send: " .. ToJSON({ call_ok = sent_ok, queued = queued }))
+        else
+            Log("EvoLab PoC IPC unavailable; raw sentinel was not delivered: " ..
+                tostring(capture_ipc_started.error))
+        end
         Log("EvoLab PoC 已采集本局原始终局字段；本次未自动启动下一局。")
         return
     end

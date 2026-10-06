@@ -623,11 +623,20 @@ def append_runner_evidence(gen, event):
 # ------------------------------------------------------------------
 # 主流程
 # ------------------------------------------------------------------
+def result_commits_enabled(capture_only):
+    """Whether this run may advance the result ledger or fitness inputs."""
+    return not bool(capture_only)
+
+
 def main():
     ap = argparse.ArgumentParser(description="EvoLab 全自动跑局")
     ap.add_argument("--matches", type=int, default=None, help="最多跑几场（默认跑完赛程）")
     ap.add_argument("--gen", type=int, default=None, help="指定代数（默认当前最新代）")
+    ap.add_argument("--capture-only", action="store_true",
+                    help="只跑一局并保留诊断证据；绝不写结果账本/fitness")
     args = ap.parse_args()
+    if args.capture_only and args.matches not in (None, 1):
+        ap.error("--capture-only 必须单局运行，--matches 只能省略或为 1")
 
     cfg = load_config()
     deploy_module(cfg)
@@ -657,10 +666,14 @@ def main():
     except ValueError as e:
         sys.exit("[拒绝] 现有结果账本无效，未启动对局：%s" % e)
     # Persist assigned IDs for legacy ledger rows before resuming.
-    EV.ER.write_results(res_file, results)
+    # Capture-only PoC must remain read-only with respect to the result ledger.
+    if result_commits_enabled(args.capture_only):
+        EV.ER.write_results(res_file, results)
     done = len(accepted)
     schedule = EV.ER.pending_matches(results, manifest)
-    if args.matches is not None:
+    if args.capture_only:
+        schedule = schedule[:1]
+    elif args.matches is not None:
         schedule = schedule[:max(0, args.matches)]
     print("[赛程] 第 %d 代计划 %d 场，已完成 %d 场，本次跑 %d 场"
           % (gen, len(manifest["matches"]), done, len(schedule)))
@@ -774,6 +787,9 @@ def main():
         print("[关联录像] match_id=%s record_id=%s path=%s new=%s candidates=%d" % (
             match["match_id"], record_id, rec_path,
             evidence["recording"]["new_since_snapshot"], len(candidate_keys)))
+        if not result_commits_enabled(args.capture_only):
+            print("[只读 PoC] 已保留 match_prepared/recording_associated 证据；跳过战报解析、结果账本与 fitness。")
+            break
         try:
             info = RPT.parse_record(rec)
         except SystemExit:

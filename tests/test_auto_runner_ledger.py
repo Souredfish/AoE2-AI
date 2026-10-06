@@ -7,6 +7,10 @@ from ai_lab import evo_results as ER
 
 
 class ReplayLedgerTests(unittest.TestCase):
+    def test_capture_only_disables_all_result_commits(self):
+        self.assertFalse(auto_runner.result_commits_enabled(True))
+        self.assertTrue(auto_runner.result_commits_enabled(False))
+
     def setUp(self):
         self.manifest = ER.build_schedule(4, [(2, 7)])
         self.match = self.manifest["matches"][0]

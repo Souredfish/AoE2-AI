@@ -29,11 +29,82 @@ local CFG = {
     spectate_mode = "eliminate",                  -- "eliminate"=P1自毁观战；"stay"=P1挂机+限时比分
 }
 
+local RESULT_CAPTURE_SETTING = "Read-only result capture PoC"
+local RESULT_CAPTURE_PREFIX = "EVOLAB_RESULT_CAPTURE_V1:"
+local capture_enabled = false
+local capture_sequence = 0
+local captured_game_speed_set = { ok = false, error = "PoC not enabled" }
+local captured_game_speed_readback = { ok = false, error = "PoC not enabled" }
+
+local function capture_value(callback)
+    local ok, value = pcall(callback)
+    if not ok then
+        return { ok = false, error = tostring(value) }
+    end
+    if value == nil then
+        return { ok = true, value_type = "nil" }
+    end
+    return { ok = true, value_type = type(value), value = value }
+end
+
+local function capture_call(callback)
+    local ok, value = pcall(callback)
+    if not ok then
+        return { call_ok = false, error = tostring(value), return_value = { ok = false } }
+    end
+    return {
+        call_ok = true,
+        return_value = value == nil and { ok = true, value_type = "nil" }
+            or { ok = true, value_type = type(value), value = value },
+    }
+end
+
+local function capture_player(slot)
+    local ok, player = pcall(GetPlayerById, slot)
+    if not ok or player == nil then
+        return {
+            slot = slot,
+            player = { ok = ok, value_type = "nil", error = ok and nil or tostring(player) },
+            has_won = { ok = false, error = "player unavailable" },
+            current_score = { ok = false, error = "player unavailable" },
+        }
+    end
+    local name = capture_value(function() return player:GetPlayerName() end)
+    return {
+        slot = slot,
+        name = name.ok and name.value or nil,
+        has_won = capture_value(function() return player:HasWon() end),
+        current_score = capture_value(function() return player:GetFact(Fact.CURRENT_SCORE) end),
+    }
+end
+
+local function capture_victory_player()
+    local ok, player = pcall(GetVictoryPlayer)
+    if not ok then
+        return { ok = false, value_type = "error", error = tostring(player) }
+    end
+    if player == nil then
+        return { ok = true, value_type = "nil" }
+    end
+    local id = capture_value(function() return player:GetId() end)
+    local name = capture_value(function() return player:GetPlayerName() end)
+    return {
+        ok = true,
+        value_type = "Player",
+        player_id = id.value,
+        player_name = name.value,
+        player_id_raw = id,
+        player_name_raw = name,
+    }
+end
+
 function Load(playerId)
     Settings.AddBool("AutoDrive", true)
+    Settings.AddBool(RESULT_CAPTURE_SETTING, false)
     if playerId ~= 1 then
         return  -- 本模块只由玩家 1 的槽位驱动，其他槽位误挂时静默退出
     end
+    capture_enabled = Settings.GetBool(RESULT_CAPTURE_SETTING, false)
     if not Settings.GetBool("AutoDrive", true) then
         Log("EvoLab: AutoDrive 已关闭，待机。")
         return
@@ -58,7 +129,17 @@ function Load(playerId)
         options:SetVictory(CFG.victory)
     end
     options:SetRecordGame(true)      -- 必须开录像：Python 战报解析依赖 .aoe2record
-    options:SetGameSpeed(CFG.speed)
+    if capture_enabled then
+        captured_game_speed_set = capture_call(function() return options:SetGameSpeed(CFG.speed) end)
+        captured_game_speed_readback = capture_value(function() return options:GetGameSpeed() end)
+        Log("EvoLab PoC speed set/readback: " .. ToJSON({
+            requested = CFG.speed,
+            set = captured_game_speed_set,
+            readback = captured_game_speed_readback,
+        }))
+    else
+        options:SetGameSpeed(CFG.speed)
+    end
     options:SetLockSpeed(true)
     options:SetPlayersCount(CFG.players)
     -- 三方各自为战
@@ -92,6 +173,22 @@ function End(hasWon)
         return
     end
     if not Settings.GetBool("AutoDrive", true) then
+        return
+    end
+    if capture_enabled then
+        capture_sequence = capture_sequence + 1
+        local observation = {
+            schema_version = 1,
+            capture_sequence = capture_sequence,
+            callback_has_won = capture_value(function() return hasWon end),
+            game_time_seconds = capture_value(GetGameTime),
+            game_speed_set = captured_game_speed_set,
+            game_speed_readback = captured_game_speed_readback,
+            victory_player = capture_victory_player(),
+            players = { capture_player(2), capture_player(3) },
+        }
+        Log(RESULT_CAPTURE_PREFIX .. ToJSON(observation))
+        Log("EvoLab PoC 已采集本局原始终局字段；本次未自动启动下一局。")
         return
     end
     Log("EvoLab: 本局结束，自动开下一局")

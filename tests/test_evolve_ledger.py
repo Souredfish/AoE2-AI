@@ -64,6 +64,20 @@ class ReportLedgerTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "胜者标记必须是布尔值"):
             evolve.result_row_from_report(info, 4, 8, self.manifest, {})
 
+    def test_nonparticipant_observer_winner_is_rejected_without_ledger_append(self):
+        info = {"players": [
+            {"name": "Observer", "winner": True},
+            {"name": "EvoAI_G4P7", "winner": False, "score": 2100},
+            {"name": "EvoAI_G4P2", "winner": False, "score": 1850},
+        ], "winners": ["EvoAI_G4P7"]}
+        results = []
+
+        with self.assertRaisesRegex(ValueError, "非参赛玩家"):
+            results.append(evolve.result_row_from_report(
+                info, 4, 8, self.manifest, {}, "observer-winner.aoe2record", "record-observer"))
+
+        self.assertEqual(results, [])
+
     def test_report_with_invalid_score_is_rejected_by_ledger_validation(self):
         info = {"players": [
             {"name": "EvoAI_G4P7", "winner": True, "score": 2100},

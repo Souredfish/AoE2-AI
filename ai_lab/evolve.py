@@ -29,6 +29,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
 import genome as G  # noqa: E402
 import make_ai as MK  # noqa: E402
+import evo_results as ER  # noqa: E402
 
 LAB = ROOT / "lab_data"
 
@@ -68,6 +69,7 @@ def cmd_init(args, cfg):
     print()
     print("第 %d 代种群就绪（%d 个个体，G%dP0 为官方默认锚点）：" % (args.gen, pop, args.gen))
     pairs = make_schedule(pop, int(ec.get("matches_per_ai", 3)), rng)
+    ER.save_schedule(LAB, args.gen, pairs)
     print("对战表（共 %d 场）：" % len(pairs))
     for a, b in pairs:
         print("   EvoAI_G%dP%d  vs  EvoAI_G%dP%d" % (args.gen, a, args.gen, b))
@@ -114,15 +116,90 @@ def cmd_report(args, cfg):
     res_dir.mkdir(parents=True, exist_ok=True)
     res_file = res_dir / ("gen_%d.json" % cur)
     results = json.loads(res_file.read_text(encoding="utf-8")) if res_file.exists() else []
-    results.append({
-        "players": [(p["name"], bool(p.get("winner"))) for p in info.get("players", [])],
-        "winners": info.get("winners", []),
-        "scores": {p["name"]: p.get("score") for p in info.get("players", [])},
-        "duration_min": info.get("duration_min"),
-        "record": info.get("file"),
-    })
-    res_file.write_text(json.dumps(results, indent=1, ensure_ascii=False), encoding="utf-8")
+    ec = evo_cfg(cfg)
+    gen_file = LAB / "generations" / ("gen_%d.json" % cur)
+    pop = len(json.loads(gen_file.read_text(encoding="utf-8")))
+    pairs = make_schedule(pop, int(ec.get("matches_per_ai", 3)), random.Random(cur * 7919))
+    expected_count = pop * int(ec.get("matches_per_ai", 3)) // 2
+    manifest = ER.load_schedule(LAB, cur, pairs, results, pop, expected_count)
+    accepted = ER.reconcile_results(results, manifest)
+    record = info.get("file")
+    canonical_record = str(Path(record).resolve()) if record else None
+    record_id = ER.match_id_for_recording(canonical_record) if canonical_record and Path(canonical_record).is_file() else None
+    for row in accepted.values():
+        same_path = canonical_record and row.get("record") and str(Path(row["record"]).resolve()).casefold() == canonical_record.casefold()
+        if (record_id and row.get("record_id") == record_id) or same_path:
+            print("[幂等] 该录像已记入单局 %s，不重复计分" % row["match_id"])
+            return
+    try:
+        result = result_row_from_report(
+            info, cur, pop, manifest, accepted, canonical_record, record_id)
+    except ValueError as e:
+        sys.exit("[拒绝] 战报未写入账本：%s" % e)
+    results.append(result)
+    try:
+        ER.reconcile_results(results, manifest)
+    except ValueError as e:
+        results.pop()
+        sys.exit("[拒绝] 结果未写入账本：%s" % e)
+    ER.write_results(res_file, results)
     print("[记账] 第 %d 代已记录 %d 场对局 → %s" % (cur, len(results), res_file))
+
+
+def result_row_from_report(info, gen, pop, manifest, accepted,
+                           canonical_record=None, record_id=None):
+    """Convert report identities into the scheduled ledger order, independent of replay order."""
+    indices = [ER.individual_from_name(p.get("name"), gen, pop)
+               for p in info.get("players", [])]
+    indices = [index for index in indices if index is not None]
+    if len(indices) != 2 or indices[0] == indices[1]:
+        raise ValueError("战报未能解析为本代两个不同参赛个体")
+
+    scheduled = next((match for match in manifest["matches"]
+                      if frozenset(ER.individual_from_name(name, gen, pop)
+                                   for name in match["players"]) == frozenset(indices)
+                      and match["match_id"] not in accepted), None)
+    if scheduled is None:
+        raise ValueError("该参赛组合不在未完成赛程中")
+
+    winners = info.get("winners") or []
+    winner_ids = [ER.individual_from_name(name, gen, pop) for name in winners]
+    if len(winner_ids) != 1 or winner_ids[0] not in indices:
+        raise ValueError("战报胜者无效或无法唯一确定；必须且只能有一个参赛胜者")
+
+    player_winner_ids = []
+    has_player_winner_flags = False
+    for player in info.get("players", []):
+        if "winner" not in player:
+            continue
+        has_player_winner_flags = True
+        flag = player["winner"]
+        if not isinstance(flag, bool):
+            raise ValueError("战报玩家胜者标记必须是布尔值")
+        if flag:
+            player_id = ER.individual_from_name(player.get("name"), gen, pop)
+            if player_id not in indices:
+                raise ValueError("战报非参赛玩家不能标记为胜者")
+            player_winner_ids.append(player_id)
+    if has_player_winner_flags and player_winner_ids != winner_ids:
+        raise ValueError("玩家胜者标记与战报 winners 不一致")
+
+    winner = ER.individual_name(gen, winner_ids[0])
+    players = scheduled["players"]
+    scores = {}
+    for player in info.get("players", []):
+        index = ER.individual_from_name(player.get("name"), gen, pop)
+        if index is not None:
+            scores[ER.individual_name(gen, index)] = player.get("score")
+    return {
+        "match_id": scheduled["match_id"],
+        "players": [[players[0], winner == players[0]], [players[1], winner == players[1]]],
+        "winners": [winner],
+        "scores": scores,
+        "duration_min": info.get("duration_min"),
+        "record": canonical_record,
+        "record_id": record_id,
+    }
 
 
 def current_gen():
@@ -147,6 +224,13 @@ def cmd_next(args, cfg):
 
     gene_pop = json.loads(gen_file.read_text(encoding="utf-8"))
     results = json.loads(res_file.read_text(encoding="utf-8"))
+    pairs = make_schedule(len(gene_pop), int(ec.get("matches_per_ai", 3)), random.Random(cur * 7919))
+    expected_count = len(gene_pop) * int(ec.get("matches_per_ai", 3)) // 2
+    manifest = ER.load_schedule(LAB, cur, pairs, results, len(gene_pop), expected_count)
+    try:
+        accepted = ER.validate_complete(results, manifest, len(gene_pop), expected_count)
+    except ValueError as e:
+        sys.exit("第 %d 代结果未通过完整性校验，拒绝繁殖：%s" % (cur, e))
 
     # ---- 积分 ----
     pop = len(gene_pop)
@@ -164,7 +248,7 @@ def cmd_next(args, cfg):
             if gi is None:
                 continue
             games[gi] += 1
-            if any(w in name for w in winners):
+            if name == winners[0]:
                 wins[gi] += 1
             sc = scores.get(name)
             opp_sc = None
@@ -228,16 +312,14 @@ def cmd_next(args, cfg):
     print()
     print("第 %d 代已生成并安装。对战表：" % nxt)
     pairs = make_schedule(pop, int(ec.get("matches_per_ai", 3)), rng)
+    ER.save_schedule(LAB, nxt, pairs)
     for a, b in pairs:
         print("   EvoAI_G%dP%d  vs  EvoAI_G%dP%d" % (nxt, a, nxt, b))
     print("继续：python run_match.py EvoAI_G%dP0 EvoAI_G%dP1 ..." % (nxt, nxt))
 
 
 def _match_individual(name, gen, pop):
-    for i in range(pop):
-        if "G%dP%d" % (gen, i) in name:
-            return i
-    return None
+    return ER.individual_from_name(name, gen, pop)
 
 
 def _tournament(fitness, k, rng):

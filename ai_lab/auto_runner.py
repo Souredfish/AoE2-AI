@@ -23,6 +23,7 @@ auto_runner.py — 全自动跑局（AoE2Control 驱动）
 
 import argparse
 import json
+import math
 import random
 import shutil
 import subprocess
@@ -161,24 +162,82 @@ def wait_new_recording(cfg, before, timeout_min):
     return None
 
 
+def _players_by_identity(info):
+    """Index the two replay AIs by their stable installed slot names."""
+    players_by_identity = {}
+    for player in info.get("players", []):
+        name = str(player.get("name", ""))
+        identity = next((key for key in ("EvoAI_A", "EvoAI_B") if key in name), None)
+        if identity:
+            if identity in players_by_identity:
+                return None
+            players_by_identity[identity] = player
+    if set(players_by_identity) != {"EvoAI_A", "EvoAI_B"}:
+        return None
+    return players_by_identity
+
+
+def _valid_score(value):
+    return value is None or (
+        isinstance(value, (int, float)) and not isinstance(value, bool)
+        and (isinstance(value, int) or math.isfinite(value))
+    )
+
+
 def resolve_winner(info, gen, a, b):
-    """返回胜者个体名 'EvoAI_G{gen}P{a|b}' 或 None。
-    玩家槽位约定：P1=观察者（索引0，恒输），P2=EvoAI_A=个体a（索引1），P3=EvoAI_B=个体b（索引2）。
-    mgz 的 players 列表顺序即玩家号顺序。"""
-    names = {1: "EvoAI_G%dP%d" % (gen, a), 2: "EvoAI_G%dP%d" % (gen, b)}
-    players = info.get("players", [])
-    # 1) mgz postgame 的 winner 标记
-    for i, p in enumerate(players):
-        if p.get("winner") and i in names:
-            return names[i]
-    # 2) 比分定胜负
-    ai_players = [players[i] for i in (1, 2) if i < len(players)]
-    if len(ai_players) == 2:
-        s1, s2 = ai_players[0].get("score"), ai_players[1].get("score")
-        if isinstance(s1, (int, float)) and isinstance(s2, (int, float)) and s1 != s2:
-            idx = 1 if s1 > s2 else 2
-            return names[idx]
+    """Map one unambiguous replay winner to its installed genome identity."""
+    identity_to_genome = {
+        "EvoAI_A": "EvoAI_G%dP%d" % (gen, a),
+        "EvoAI_B": "EvoAI_G%dP%d" % (gen, b),
+    }
+    players_by_identity = _players_by_identity(info)
+    if players_by_identity is None:
+        return None
+
+    if any(not _valid_score(player.get("score")) for player in players_by_identity.values()):
+        return None
+    explicit_winners = [identity for identity, player in players_by_identity.items()
+                        if player.get("winner") is True]
+    if len(explicit_winners) > 1:
+        return None
+    if explicit_winners:
+        return identity_to_genome[explicit_winners[0]]
+
+    # If the replay has no explicit winner marker, compare scores by identity.
+    score_a = players_by_identity["EvoAI_A"].get("score")
+    score_b = players_by_identity["EvoAI_B"].get("score")
+    if (isinstance(score_a, (int, float)) and isinstance(score_b, (int, float))
+            and score_a != score_b):
+        identity = "EvoAI_A" if score_a > score_b else "EvoAI_B"
+        return identity_to_genome[identity]
     return None
+
+
+def match_result_from_replay(info, gen, a, b, match, record, record_id):
+    """Build one ledger row, rejecting ambiguous winners and invalid scores."""
+    na, nb = "EvoAI_G%dP%d" % (gen, a), "EvoAI_G%dP%d" % (gen, b)
+    players_by_identity = _players_by_identity(info)
+    if players_by_identity is None:
+        raise ValueError("录像未能唯一映射到 EvoAI_A 与 EvoAI_B")
+    if any(not _valid_score(player.get("score"))
+           for player in players_by_identity.values()):
+        raise ValueError("录像比分必须是有限数值或缺失")
+    winner_name = resolve_winner(info, gen, a, b)
+    if winner_name not in (na, nb):
+        raise ValueError("录像胜者无效、多个胜者或无法唯一判定")
+    scores = {
+        na: players_by_identity["EvoAI_A"].get("score"),
+        nb: players_by_identity["EvoAI_B"].get("score"),
+    }
+    return {
+        "match_id": match["match_id"],
+        "players": [[na, winner_name == na], [nb, winner_name == nb]],
+        "winners": [winner_name],
+        "scores": scores,
+        "duration_min": info.get("duration_min"),
+        "record": str(record),
+        "record_id": record_id,
+    }
 
 
 # ------------------------------------------------------------------
@@ -201,19 +260,30 @@ def main():
     gene_pop = json.loads(gen_file.read_text(encoding="utf-8"))
     pop = len(gene_pop)
     ec = EV.evo_cfg(cfg)
-    rng = random.Random(gen * 7919)
-    schedule = EV.make_schedule(pop, int(ec.get("matches_per_ai", 3)), rng)
-    if args.matches:
-        schedule = schedule[: args.matches]
-
+    pairs = EV.make_schedule(pop, int(ec.get("matches_per_ai", 3)), random.Random(gen * 7919))
+    expected_count = pop * int(ec.get("matches_per_ai", 3)) // 2
     res_dir = LAB / "results"
     res_dir.mkdir(parents=True, exist_ok=True)
     res_file = res_dir / ("gen_%d.json" % gen)
     results = json.loads(res_file.read_text(encoding="utf-8")) if res_file.exists() else []
-    done = len(results)
-    schedule = schedule[done:]
-    print("[赛程] 第 %d 代共需 %d 场，已完成 %d 场，本次跑 %d 场"
-          % (gen, done + len(schedule), done, len(schedule)))
+    manifest = EV.ER.load_schedule(LAB, gen, pairs, results, pop, expected_count)
+    try:
+        EV.ER.validate_schedule(manifest, pop, expected_count)
+    except ValueError as e:
+        sys.exit("[拒绝] 赛程本身不完整或覆盖不足：%s" % e)
+
+    try:
+        accepted = EV.ER.reconcile_results(results, manifest)
+    except ValueError as e:
+        sys.exit("[拒绝] 现有结果账本无效，未启动对局：%s" % e)
+    # Persist assigned IDs for legacy ledger rows before resuming.
+    EV.ER.write_results(res_file, results)
+    done = len(accepted)
+    schedule = EV.ER.pending_matches(results, manifest)
+    if args.matches is not None:
+        schedule = schedule[:max(0, args.matches)]
+    print("[赛程] 第 %d 代计划 %d 场，已完成 %d 场，本次跑 %d 场"
+          % (gen, len(manifest["matches"]), done, len(schedule)))
     if not schedule:
         print("[完成] 本代赛程已全部跑完，直接执行 evolve.py next 即可")
         return
@@ -242,9 +312,12 @@ def main():
     print()
 
     timeout_min = int(cfg.get("control", {}).get("auto_match_timeout_min", 150))
-    for idx, (a, b) in enumerate(schedule):
+    for idx, match in enumerate(schedule):
+        a, b = [EV.ER.individual_from_name(n, gen, pop) for n in match["players"]]
+        if a is None or b is None:
+            sys.exit("[拒绝] 赛程参赛名无效: %s" % match)
         print("[对局 %d/%d] EvoAI_G%dP%d  vs  EvoAI_G%dP%d"
-              % (done + idx + 1, done + len(schedule), gen, a, gen, b))
+              % (done + idx + 1, len(manifest["matches"]), gen, a, gen, b))
         # 换上本局的两个基因
         MK.install("A", {k: v for k, v in gene_pop[a].items()}, cfg)
         MK.install("B", {k: v for k, v in gene_pop[b].items()}, cfg)
@@ -265,23 +338,22 @@ def main():
             info = {"players": [], "winners": []}
             print("[警告] 录像解析失败: %s" % e)
 
-        winner_name = resolve_winner(info, gen, a, b)
         na, nb = "EvoAI_G%dP%d" % (gen, a), "EvoAI_G%dP%d" % (gen, b)
-        scores = {}
-        players = info.get("players", [])
-        for i, p in enumerate(players):
-            if i == 1:
-                scores[na] = p.get("score")
-            elif i == 2:
-                scores[nb] = p.get("score")
-        results.append({
-            "players": [[na, winner_name == na], [nb, winner_name == nb]],
-            "winners": [winner_name] if winner_name else [],
-            "scores": scores,
-            "duration_min": info.get("duration_min"),
-            "record": str(rec),
-        })
-        res_file.write_text(json.dumps(results, indent=1, ensure_ascii=False), encoding="utf-8")
+        try:
+            result = match_result_from_replay(
+                info, gen, a, b, match, rec.resolve(), EV.ER.match_id_for_recording(rec))
+        except ValueError as e:
+            print("[拒绝] %s；录像保留，账本不推进。修正录像结果后重新运行。" % e)
+            break
+        winner_name = result["winners"][0]
+        results.append(result)
+        try:
+            EV.ER.reconcile_results(results, manifest)
+        except ValueError as e:
+            results.pop()
+            print("[拒绝] 对局结果未写入账本：%s" % e)
+            break
+        EV.ER.write_results(res_file, results)
         if winner_name:
             print("[结果] 胜者: %s" % winner_name)
         else:

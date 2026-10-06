@@ -8,6 +8,33 @@ from ai_lab import auto_runner
 
 
 class WindowReadinessTests(unittest.TestCase):
+    def _window(self, hwnd=1, visible=True, minimized=False, width=1382, height=807):
+        return {
+            "hwnd": hwnd, "title": "Age of Empires II: Definitive Edition",
+            "visible": visible, "minimized": minimized,
+            "width": width, "height": height,
+        }
+
+    def test_game_window_gate_rejects_unready_or_ambiguous_main_window(self):
+        cases = [
+            ([self._window(visible=False)], "不可见"),
+            ([self._window(minimized=True, width=160, height=28)], "最小化"),
+            ([self._window(width=500, height=300)], "尺寸小于"),
+            ([self._window(visible=False), self._window(hwnd=2)], "识别不唯一"),
+            ([self._window(minimized=True, width=160, height=28),
+              self._window(hwnd=2)], "识别不唯一"),
+        ]
+        for windows, expected_reason in cases:
+            with self.subTest(windows=windows):
+                ready, reason = auto_runner.evaluate_game_windows(windows)
+                self.assertFalse(ready)
+                self.assertIn(expected_reason, reason)
+
+    def test_game_window_gate_accepts_only_one_ready_main_window(self):
+        ready, reason = auto_runner.evaluate_game_windows([self._window()])
+        self.assertTrue(ready)
+        self.assertIn("hwnd=0x1", reason)
+
     def _wait(self, states, timeout=4):
         now = [0.0]
 

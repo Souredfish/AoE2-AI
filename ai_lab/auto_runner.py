@@ -114,6 +114,30 @@ CONTROL_SUCCESS_STATUSES = {
 }
 
 
+def evaluate_game_windows(windows):
+    """Fail closed unless exactly one candidate main window is ready."""
+    if not windows:
+        return False, "未找到游戏进程的无主标题窗口"
+    if len(windows) != 1:
+        details = "; ".join(
+            "hwnd=0x%x visible=%s minimized=%s size=%dx%d title=%r" %
+            (w["hwnd"], w["visible"], w["minimized"],
+             w["width"], w["height"], w["title"])
+            for w in windows)
+        return False, "游戏主窗口识别不唯一（%d 个候选：%s）" % (len(windows), details)
+    window = windows[0]
+    detail = "hwnd=0x%x visible=%s minimized=%s size=%dx%d title=%r" % (
+        window["hwnd"], window["visible"], window["minimized"],
+        window["width"], window["height"], window["title"])
+    if not window["visible"]:
+        return False, "游戏主窗口不可见（%s）" % detail
+    if window["minimized"]:
+        return False, "游戏主窗口已最小化（%s）" % detail
+    if window["width"] < WINDOW_MIN_WIDTH or window["height"] < WINDOW_MIN_HEIGHT:
+        return False, "游戏主窗口尺寸小于 640×360（%s）" % detail
+    return True, "游戏主窗口就绪（%s）" % detail
+
+
 def control_terminal_status(stdout):
     """Return the documented Headless terminal status, or None if unknown."""
     lines = [line.strip() for line in (stdout or "").splitlines() if line.strip()]
@@ -145,30 +169,30 @@ def game_window_status():
             return False, "未找到 AoE2DE_s.exe 进程"
 
         user32 = ctypes.windll.user32
-        found = []
+        windows = []
         callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
         @callback_type
         def visit(hwnd, _):
             pid = wintypes.DWORD()
             user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-            if pid.value in pids and user32.IsWindowVisible(hwnd):
+            if pid.value in pids and not user32.GetWindow(hwnd, 4):  # GW_OWNER
                 rect = wintypes.RECT()
-                if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
-                    minimized = bool(user32.IsIconic(hwnd))
-                    width, height = rect.right - rect.left, rect.bottom - rect.top
-                    found.append((minimized, width, height))
+                title = ctypes.create_unicode_buffer(512)
+                user32.GetWindowTextW(hwnd, title, len(title))
+                if title.value and user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                    windows.append({
+                        "hwnd": int(hwnd),
+                        "title": title.value,
+                        "visible": bool(user32.IsWindowVisible(hwnd)),
+                        "minimized": bool(user32.IsIconic(hwnd)),
+                        "width": rect.right - rect.left,
+                        "height": rect.bottom - rect.top,
+                    })
             return True
 
         user32.EnumWindows(visit, 0)
-        if not found:
-            return False, "游戏窗口不存在或不可见"
-        if not any(not minimized for minimized, _, _ in found):
-            return False, "游戏窗口已最小化"
-        if not any(not minimized and width >= WINDOW_MIN_WIDTH and height >= WINDOW_MIN_HEIGHT
-                   for minimized, width, height in found):
-            return False, "游戏窗口尺寸小于 640×360"
-        return True, "窗口可见、未最小化且尺寸满足要求"
+        return evaluate_game_windows(windows)
     except Exception as exc:
         return False, "窗口探测失败: %s" % exc
 

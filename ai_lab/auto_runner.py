@@ -395,8 +395,11 @@ def ensure_control(cfg, max_wait_s=600, window_probe=game_window_status,
 # ------------------------------------------------------------------
 # 对局结果
 # ------------------------------------------------------------------
-def list_recordings(cfg):
-    return REC.list_recordings(cfg)
+def list_recordings(cfg, *, strict=False, diagnostic=None,
+                    diagnostic_context=None):
+    return REC.list_recordings(
+        cfg, strict=strict, diagnostic=diagnostic,
+        diagnostic_context=diagnostic_context)
 
 
 def wait_new_recording(cfg, before, timeout_min, *, diagnostic=None,
@@ -473,7 +476,13 @@ def wait_new_recording(cfg, before, timeout_min, *, diagnostic=None,
         if candidate_key is not None and candidate_key in now:
             key = candidate_key
             first_stat = now[key]
-            sleep(settle_interval_s)  # 等游戏完成录像写入
+            remaining_s = deadline - clock()
+            if remaining_s <= 0:
+                emit("recording_deadline_expired", iteration=iteration,
+                     phase="before_settle_wait", candidate=key,
+                     first_stat=first_stat, remaining_s=0)
+                break
+            sleep(min(settle_interval_s, remaining_s))  # 等游戏完成录像写入
             if clock() >= deadline:
                 emit("recording_deadline_expired", iteration=iteration,
                      phase="after_settle_wait", candidate=key,
@@ -548,7 +557,10 @@ def wait_new_recording(cfg, before, timeout_min, *, diagnostic=None,
                              remaining_s=0)
                         break
                     return path
-        sleep(poll_interval_s)
+        remaining_s = deadline - clock()
+        if remaining_s <= 0:
+            break
+        sleep(min(poll_interval_s, remaining_s))
 
     emit("recording_wait_timeout", iterations=iteration,
          elapsed_s=round(clock() - started, 3), last_new_keys=last_new_keys)
@@ -558,7 +570,9 @@ def wait_new_recording(cfg, before, timeout_min, *, diagnostic=None,
 def recording_snapshot(cfg, *, diagnostic=None, diagnostic_context=None, strict=False):
     """Capture stable file signatures before a match can create its replay."""
     snapshot = {}
-    for key, path in list_recordings(cfg).items():
+    for key, path in list_recordings(
+            cfg, strict=strict, diagnostic=diagnostic,
+            diagnostic_context=diagnostic_context).items():
         try:
             stat = path.stat()
         except OSError as exc:

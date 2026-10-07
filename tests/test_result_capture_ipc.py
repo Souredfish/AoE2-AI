@@ -3,6 +3,7 @@ import queue
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -13,6 +14,7 @@ from ai_lab.result_capture_ipc import (CaptureIPCRejected, append_capture_associ
                                        load_raw_capture, parse_ipc_envelope,
                                        WindowsPipeCaptureReceiver, _binding_request,
                                        _capture_hello_request, _is_capture_ready,
+                                       run_bounded_capture_io,
                                        _send_capture_hellos, CAPTURE_MODULE_BUILD)
 
 
@@ -32,6 +34,40 @@ def envelope(payload=None, source=None):
 
 
 class ResultCaptureIPCTests(unittest.TestCase):
+    def test_capture_file_io_timeout_is_bounded_and_diagnostic(self):
+        release = threading.Event()
+        completed = threading.Event()
+        events = []
+        started = time.monotonic()
+
+        def blocked_operation():
+            release.wait()
+            completed.set()
+
+        try:
+            with self.assertRaisesRegex(TimeoutError, "association append.*超时"):
+                run_bounded_capture_io(
+                    "association append", blocked_operation, timeout_s=0.02,
+                    diagnostic=events.append)
+        finally:
+            release.set()
+
+        self.assertTrue(completed.wait(1))
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertEqual([event["stage"] for event in events],
+                         ["association append_started", "association append_timeout"])
+        self.assertTrue(all("elapsed_s" in event for event in events))
+
+    def test_bounded_capture_io_returns_result_and_keeps_capture_only_read_only(self):
+        events = []
+        self.assertEqual(run_bounded_capture_io(
+            "raw capture validation", lambda: "verified", timeout_s=1,
+            diagnostic=events.append), "verified")
+        self.assertEqual([event["stage"] for event in events],
+                         ["raw capture validation_started", "raw capture validation_finished"])
+        from ai_lab import auto_runner
+        self.assertFalse(auto_runner.result_commits_enabled(True))
+
     def association(self):
         return {
             "match_id": "g0-m0001",
@@ -51,11 +87,22 @@ class ResultCaptureIPCTests(unittest.TestCase):
             path = Path(tmp) / "raw.jsonl"
             append_raw_capture(path, message, "g0-m0001")
             association = self.association()
-            append_capture_association(path, association)
-            row = load_raw_capture(path, "g0-m0001", association)
+            append_diagnostics = []
+            append_capture_association(path, association, diagnostic=append_diagnostics.append)
+            read_diagnostics = []
+            row = load_raw_capture(path, "g0-m0001", association,
+                                   diagnostic=read_diagnostics.append)
             self.assertEqual(row["raw_sentinel"], raw)
             self.assertEqual(row["source"]["moduleName"], "evolab_driver")
             self.assertEqual(row["runner_association"]["recording"]["sha256"], "c" * 64)
+            append_stages = [event["stage"] for event in append_diagnostics]
+            self.assertIn("association_os_open_append_started", append_stages)
+            self.assertIn("association_append_write_finished", append_stages)
+            self.assertIn("association_append_fsync_finished", append_stages)
+            self.assertEqual(read_diagnostics[0]["stage"],
+                             "raw_capture_validation_read_started")
+            self.assertEqual(read_diagnostics[-1]["stage"],
+                             "raw_capture_validation_read_finished")
 
     def test_malformed_envelope_or_untrusted_source_is_rejected(self):
         with self.assertRaisesRegex(CaptureIPCRejected, "envelope"):

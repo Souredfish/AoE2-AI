@@ -7,6 +7,7 @@ sentinel string verbatim; parsed conclusions belong in the separate PoC output.
 import hashlib
 import json
 import os
+import queue
 import re
 import threading
 import time
@@ -23,6 +24,73 @@ _MATCH_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 class CaptureIPCRejected(ValueError):
     """The IPC frame cannot be trusted as one raw capture event."""
+
+
+def _emit_diagnostic(diagnostic, stage, **details):
+    if diagnostic is None:
+        return
+    try:
+        diagnostic({"stage": stage, **details})
+    except Exception:
+        # Diagnostics must never change the fail-closed capture behavior.
+        pass
+
+
+def _timed_io(stage, diagnostic, operation):
+    started = time.monotonic()
+    _emit_diagnostic(diagnostic, stage + "_started", elapsed_s=0.0)
+    try:
+        result = operation()
+    except Exception as exc:
+        _emit_diagnostic(diagnostic, stage + "_failed",
+                         elapsed_s=round(time.monotonic() - started, 3),
+                         error="%s: %s" % (type(exc).__name__, exc))
+        raise
+    _emit_diagnostic(diagnostic, stage + "_finished",
+                     elapsed_s=round(time.monotonic() - started, 3))
+    return result
+
+
+def run_bounded_capture_io(stage, operation, timeout_s=30, diagnostic=None):
+    """Run potentially blocking filesystem work without stalling the runner forever.
+
+    A timed-out worker is daemonized: the caller fails closed immediately, and
+    process shutdown will release any Windows CRT/file handles if an OS call is
+    stuck. The caller must not start another operation on that file afterward.
+    """
+    if timeout_s <= 0:
+        raise ValueError("capture I/O timeout must be positive")
+    outcome = queue.Queue(maxsize=1)
+    done = threading.Event()
+    started = time.monotonic()
+    _emit_diagnostic(diagnostic, stage + "_started", timeout_s=timeout_s,
+                     elapsed_s=0.0)
+
+    def invoke():
+        try:
+            outcome.put((True, operation()))
+        except BaseException as exc:
+            outcome.put((False, exc))
+        finally:
+            done.set()
+
+    worker = threading.Thread(target=invoke, name="CaptureFileIO", daemon=True)
+    worker.start()
+    if not done.wait(timeout_s):
+        _emit_diagnostic(diagnostic, stage + "_timeout",
+                         timeout_s=timeout_s,
+                         elapsed_s=round(time.monotonic() - started, 3),
+                         worker_alive=worker.is_alive())
+        raise TimeoutError("%s 超时（%.1f 秒）；runner 已停止后续采集校验" % (
+            stage, timeout_s))
+    ok, value = outcome.get_nowait()
+    elapsed = round(time.monotonic() - started, 3)
+    if not ok:
+        _emit_diagnostic(diagnostic, stage + "_failed", elapsed_s=elapsed,
+                         error="%s: %s" % (type(value).__name__, value))
+        raise value
+    _emit_diagnostic(diagnostic, stage + "_finished", elapsed_s=elapsed)
+    return value
 
 
 def _validate_sentinel(raw_sentinel):
@@ -150,14 +218,16 @@ def append_raw_capture(path, message, match_id, received_at_utc=None):
     return row
 
 
-def append_capture_association(path, association):
+def append_capture_association(path, association, diagnostic=None):
     """Append runner-owned identity and replay hashes after the replay is stable."""
     if not isinstance(association, dict) or not isinstance(association.get("match_id"), str):
         raise CaptureIPCRejected("runner 原始采集关联字段缺失")
     path = Path(path)
     try:
-        rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
-                if line.strip()]
+        source_text = _timed_io(
+            "association_preappend_read", diagnostic,
+            lambda: path.read_text(encoding="utf-8"))
+        rows = [json.loads(line) for line in source_text.splitlines() if line.strip()]
     except (OSError, ValueError) as exc:
         raise CaptureIPCRejected("关联原始 sentinel 前 JSONL 缺失或损坏") from exc
     if (len(rows) != 1 or rows[0].get("kind") != "raw_control_ipc_capture"
@@ -177,13 +247,35 @@ def append_capture_association(path, association):
     row = {"schema_version": 1, "kind": "runner_capture_association", **normalized}
     encoded = (json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
     try:
-        fd = os.open(str(path), os.O_WRONLY | os.O_APPEND)
+        fd = _timed_io("association_os_open_append", diagnostic,
+                       lambda: os.open(str(path), os.O_WRONLY | os.O_APPEND))
     except OSError as exc:
         raise CaptureIPCRejected("无法向原始 IPC JSONL 追加赛程关联") from exc
-    with os.fdopen(fd, "ab") as stream:
-        stream.write(encoded)
-        stream.flush()
-        os.fsync(stream.fileno())
+    stream = None
+    try:
+        stream = _timed_io("association_fdopen", diagnostic,
+                           lambda: os.fdopen(fd, "ab"))
+        with stream:
+            _timed_io("association_append_write", diagnostic,
+                       lambda: stream.write(encoded))
+            _timed_io("association_append_flush", diagnostic, stream.flush)
+            _timed_io("association_append_fsync", diagnostic,
+                       lambda: os.fsync(stream.fileno()))
+    except OSError as exc:
+        # fdopen owns the descriptor after succeeding; close only if it failed.
+        if stream is None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        raise CaptureIPCRejected("追加 runner 赛程关联时文件 I/O 失败") from exc
+    except Exception:
+        if stream is None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        raise
     return row
 
 
@@ -193,11 +285,14 @@ def raw_capture_path(directory, match_id):
     return Path(directory) / ("result_capture_raw_%s.jsonl" % match_id)
 
 
-def load_raw_capture(path, expected_match_id, expected_association=None):
+def load_raw_capture(path, expected_match_id, expected_association=None,
+                     diagnostic=None):
     """Load raw source plus runner association and verify both immutable rows."""
     try:
-        rows = [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines()
-                if line.strip()]
+        raw_text = _timed_io(
+            "raw_capture_validation_read", diagnostic,
+            lambda: Path(path).read_text(encoding="utf-8"))
+        rows = [json.loads(line) for line in raw_text.splitlines() if line.strip()]
     except (OSError, ValueError) as exc:
         raise CaptureIPCRejected("原始 IPC JSONL 缺失或损坏") from exc
     if len(rows) != 2:

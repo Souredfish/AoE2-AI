@@ -44,7 +44,8 @@ import evolve as EV  # noqa: E402
 import recordings as REC  # noqa: E402
 from result_capture_ipc import (CaptureIPCRejected, WindowsPipeCaptureReceiver,
                                 append_capture_association, load_raw_capture,
-                                raw_capture_path)  # noqa: E402
+                                raw_capture_path,
+                                run_bounded_capture_io)  # noqa: E402
 
 LAB = ROOT / "lab_data"
 CONTROL_CFG = Path.home().parent.parent / "AppData/Roaming"  # %APPDATA%
@@ -1038,8 +1039,12 @@ def main():
             evidence["recording"]["new_since_snapshot"], len(candidate_keys)))
         if not result_commits_enabled(args.capture_only):
             try:
-                capture_receiver.wait_for_capture(10)
-                capture_receiver.stop()
+                run_bounded_capture_io(
+                    "wait_for_capture", lambda: capture_receiver.wait_for_capture(10),
+                    timeout_s=12, diagnostic=log_capture_ipc)
+                run_bounded_capture_io(
+                    "capture_receiver_stop", capture_receiver.stop,
+                    timeout_s=8, diagnostic=log_capture_ipc)
                 capture_association = {
                     "match_id": match["match_id"],
                     "slots_by_alias": evidence["slots_by_alias"],
@@ -1050,10 +1055,18 @@ def main():
                         "sha256": evidence["recording"]["sha256"],
                     },
                 }
-                append_capture_association(raw_path, capture_association)
-                raw_row = load_raw_capture(
-                    raw_path, match["match_id"], capture_association)
-            except (CaptureIPCRejected, RuntimeError) as e:
+                run_bounded_capture_io(
+                    "append_capture_association",
+                    lambda: append_capture_association(
+                        raw_path, capture_association, diagnostic=log_capture_ipc),
+                    timeout_s=30, diagnostic=log_capture_ipc)
+                raw_row = run_bounded_capture_io(
+                    "load_raw_capture",
+                    lambda: load_raw_capture(
+                        raw_path, match["match_id"], capture_association,
+                        diagnostic=log_capture_ipc),
+                    timeout_s=30, diagnostic=log_capture_ipc)
+            except (CaptureIPCRejected, RuntimeError, TimeoutError) as e:
                 print("[PoC 拒绝] 未能非交互取得唯一原始 IPC sentinel：%s；账本/fitness 未写入。" % e)
                 break
             print("[PoC IPC] 已追加并校验原始 sentinel：%s sha256=%s" % (

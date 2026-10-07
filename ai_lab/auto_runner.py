@@ -796,6 +796,35 @@ def append_runner_evidence(gen, event):
         stream.write(json.dumps(event, ensure_ascii=False, sort_keys=True) + "\n")
 
 
+class RecordingBaselineError(RuntimeError):
+    """The runner could not prove a complete pre-start replay baseline."""
+
+
+def capture_baseline_before_start(cfg, match_id, startup, diagnostic=None):
+    """Take a strict recording baseline before invoking anything that can start a game."""
+    captured_at_ns = time.time_ns()
+    try:
+        before = recording_snapshot(
+            cfg, diagnostic=diagnostic,
+            diagnostic_context={"phase": "baseline", "match_id": match_id},
+            strict=True)
+    except Exception as exc:
+        raise RecordingBaselineError(str(exc)) from exc
+    if diagnostic is not None:
+        try:
+            diagnostic({
+                "event": "recording_baseline_complete",
+                "match_id": match_id,
+                "captured_at_ns": captured_at_ns,
+                "recording_count": len(before),
+                "keys": sorted(before),
+            })
+        except Exception:
+            pass
+    startup_result = startup()
+    return captured_at_ns, before, startup_result
+
+
 # ------------------------------------------------------------------
 # 主流程
 # ------------------------------------------------------------------
@@ -815,8 +844,6 @@ def main():
         ap.error("--capture-only 必须单局运行，--matches 只能省略或为 1")
 
     cfg = load_config()
-    deploy_module(cfg)
-
     # ---- 进化赛程 ----
     gen = args.gen if args.gen is not None else EV.current_gen()
     gen_file = LAB / "generations" / ("gen_%d.json" % gen)
@@ -857,9 +884,28 @@ def main():
         print("[完成] 本代赛程已全部跑完，直接执行 evolve.py next 即可")
         return
 
-    # ---- 游戏与 CONTROL ----
-    if not ensure_control(cfg):
+    # ---- 录像基线与游戏启动 ----
+    timeout_min = int(cfg.get("control", {}).get("auto_match_timeout_min", 150))
+    capture_receiver = None
+
+    def log_recording_probe(event):
+        print("[录像探测] " + json.dumps(event, ensure_ascii=False, sort_keys=True))
+
+    def launch_control():
+        deploy_module(cfg)
+        return ensure_control(cfg)
+
+    try:
+        initial_baseline_captured_at_ns, initial_recording_baseline, control_ready = (
+            capture_baseline_before_start(
+                cfg, schedule[0]["match_id"], launch_control,
+                diagnostic=log_recording_probe))
+    except RecordingBaselineError as exc:
+        sys.exit("[拒绝] 启动前录像基线不完整，未部署/启动本场：%s" % exc)
+    if not control_ready:
         sys.exit(1)
+
+    # ---- CONTROL 模块配置 ----
     ok, why = check_module_assigned()
     if not ok:
         print()
@@ -879,12 +925,6 @@ def main():
     print("[开始] 全自动跑局。停止方法：CONTROL 菜单关掉 Player1 的模块，或按 Delete 卸载 CONTROL。")
     print("[提示] 想看就切到游戏窗口；不想看就让它跑，战报自动落盘。")
     print()
-
-    timeout_min = int(cfg.get("control", {}).get("auto_match_timeout_min", 150))
-    capture_receiver = None
-
-    def log_recording_probe(event):
-        print("[录像探测] " + json.dumps(event, ensure_ascii=False, sort_keys=True))
 
     if args.capture_only:
         raw_path = raw_capture_path(LAB / "runner_evidence", schedule[0]["match_id"])
@@ -914,23 +954,27 @@ def main():
               % (done + idx + 1, len(manifest["matches"]), gen, a, gen, b))
         # Capture exactly what existed before this match, then record installed
         # identities before waiting for a replay to appear.
-        baseline_captured_at_ns = time.time_ns()
-        try:
-            before = recording_snapshot(
-                cfg, diagnostic=log_recording_probe,
-                diagnostic_context={"phase": "baseline", "match_id": match["match_id"]},
-                strict=True)
-        except Exception as exc:
-            if capture_receiver is not None:
-                capture_receiver.stop()
-            sys.exit("[拒绝] 赛前录像基线不完整，未启动本场：%s" % exc)
-        log_recording_probe({
-            "event": "recording_baseline_complete",
-            "match_id": match["match_id"],
-            "captured_at_ns": baseline_captured_at_ns,
-            "recording_count": len(before),
-            "keys": sorted(before),
-        })
+        if idx == 0:
+            baseline_captured_at_ns = initial_baseline_captured_at_ns
+            before = initial_recording_baseline
+        else:
+            baseline_captured_at_ns = time.time_ns()
+            try:
+                before = recording_snapshot(
+                    cfg, diagnostic=log_recording_probe,
+                    diagnostic_context={"phase": "baseline", "match_id": match["match_id"]},
+                    strict=True)
+            except Exception as exc:
+                if capture_receiver is not None:
+                    capture_receiver.stop()
+                sys.exit("[拒绝] 本场录像基线不完整：%s" % exc)
+            log_recording_probe({
+                "event": "recording_baseline_complete",
+                "match_id": match["match_id"],
+                "captured_at_ns": baseline_captured_at_ns,
+                "recording_count": len(before),
+                "keys": sorted(before),
+            })
         MK.install("A", {k: v for k, v in gene_pop[a].items()}, cfg)
         MK.install("B", {k: v for k, v in gene_pop[b].items()}, cfg)
         ai_dir = Path(cfg["game"]["ai_dir"])

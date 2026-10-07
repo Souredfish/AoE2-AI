@@ -262,6 +262,56 @@ class RecordingWaitTests(unittest.TestCase):
         self.assertEqual(self.clock.sleeps, [5, 1])
         self.assertEqual(self.clock.now(), 6)
 
+    def test_initial_baseline_precedes_start_and_detects_started_match_recording(self):
+        order = []
+        old_path = "old.aoe2record"
+        new_path = "match-created-on-start.aoe2record"
+        initial = {old_path: self.before["old.aoe2record"]}
+        created = {}
+        fake_recording = object()
+
+        def snapshot(_cfg, *, strict=False, **kwargs):
+            self.assertTrue(strict)
+            self.assertEqual(kwargs["diagnostic_context"]["phase"], "baseline")
+            order.append("snapshot")
+            return initial
+
+        def startup():
+            order.append("startup")
+            created[new_path] = self.signature
+            return True
+
+        with patch.object(auto_runner, "recording_snapshot", side_effect=snapshot):
+            captured_at, baseline, started = auto_runner.capture_baseline_before_start(
+                {}, "g0-m0001", startup, diagnostic=self.events.append)
+
+        self.assertGreater(captured_at, 0)
+        self.assertTrue(started)
+        self.assertEqual(order, ["snapshot", "startup"])
+        self.assertEqual(baseline, initial)
+        current = {**baseline, **created}
+        self.assertEqual(set(current) - set(baseline), {new_path})
+
+        with patch.object(auto_runner, "recording_snapshot", side_effect=[current, current]), \
+                patch.object(auto_runner, "list_recordings",
+                             return_value={new_path: fake_recording}):
+            discovered = auto_runner.wait_new_recording(
+                {}, baseline, 1, clock=self.clock.now, sleep=self.clock.sleep,
+                poll_interval_s=1, settle_interval_s=1)
+
+        self.assertIs(discovered, fake_recording)
+
+    def test_failed_initial_baseline_never_invokes_startup(self):
+        startup_calls = []
+        with patch.object(auto_runner, "recording_snapshot",
+                          side_effect=PermissionError("baseline unavailable")):
+            with self.assertRaisesRegex(auto_runner.RecordingBaselineError,
+                                        "baseline unavailable"):
+                auto_runner.capture_baseline_before_start(
+                    {}, "g0-m0001", lambda: startup_calls.append(True))
+
+        self.assertEqual(startup_calls, [])
+
     def test_missing_expected_directory_is_not_an_enumeration_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             missing = Path(tmp) / "not-created"

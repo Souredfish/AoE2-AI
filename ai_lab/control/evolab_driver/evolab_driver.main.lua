@@ -29,11 +29,160 @@ local CFG = {
     spectate_mode = "eliminate",                  -- "eliminate"=P1自毁观战；"stay"=P1挂机+限时比分
 }
 
+local RESULT_CAPTURE_SETTING = "Read-only result capture PoC"
+local RESULT_CAPTURE_PREFIX = "EVOLAB_RESULT_CAPTURE_V1:"
+local RESULT_CAPTURE_PIPE = "EvoLabResultCaptureV1"
+local RESULT_CAPTURE_MODULE_BUILD = "sour100-ipc-wait-message-v3"
+local capture_enabled = false
+local capture_ipc_started = { ok = false, error = "PoC not enabled" }
+local capture_match_id = nil
+local capture_sequence = 0
+local capture_ready_logged = false
+local captured_game_speed_set = { ok = false, error = "PoC not enabled" }
+local captured_game_speed_readback = { ok = false, error = "PoC not enabled" }
+local capture_update_count = 0
+local capture_hello_count = 0
+local capture_receive_error_count = 0
+
+local function capture_value(callback)
+    local ok, value = pcall(callback)
+    if not ok then
+        return { ok = false, error = tostring(value) }
+    end
+    if value == nil then
+        return { ok = true, value_type = "nil" }
+    end
+    return { ok = true, value_type = type(value), value = value }
+end
+
+local function capture_call(callback)
+    local ok, value = pcall(callback)
+    if not ok then
+        return { call_ok = false, error = tostring(value), return_value = { ok = false } }
+    end
+    return {
+        call_ok = true,
+        return_value = value == nil and { ok = true, value_type = "nil" }
+            or { ok = true, value_type = type(value), value = value },
+    }
+end
+
+local function capture_player(slot)
+    local ok, player = pcall(GetPlayerById, slot)
+    if not ok or player == nil then
+        return {
+            slot = slot,
+            player = { ok = ok, value_type = "nil", error = ok and nil or tostring(player) },
+            has_won = { ok = false, error = "player unavailable" },
+            current_score = { ok = false, error = "player unavailable" },
+        }
+    end
+    local name = capture_value(function() return player:GetPlayerName() end)
+    return {
+        slot = slot,
+        name = name.ok and name.value or nil,
+        has_won = capture_value(function() return player:HasWon() end),
+        current_score = capture_value(function() return player:GetFact(Fact.CURRENT_SCORE) end),
+    }
+end
+
+local function capture_victory_player()
+    local ok, player = pcall(GetVictoryPlayer)
+    if not ok then
+        return { ok = false, value_type = "error", error = tostring(player) }
+    end
+    if player == nil then
+        return { ok = true, value_type = "nil" }
+    end
+    local id = capture_value(function() return player:GetId() end)
+    local name = capture_value(function() return player:GetPlayerName() end)
+    return {
+        ok = true,
+        value_type = "Player",
+        player_id = id.value,
+        player_name = name.value,
+        player_id_raw = id,
+        player_name_raw = name,
+    }
+end
+
+local function receive_capture_ipc_messages()
+    local messages = {}
+    local has_ok, has_messages = pcall(function() return IPC.HasMessages() end)
+    if not has_ok then
+        return nil, "IPC.HasMessages failed: " .. tostring(has_messages)
+    end
+    if type(has_messages) ~= "boolean" then
+        return nil, "IPC.HasMessages returned " .. type(has_messages)
+    end
+
+    local received = 0
+    while has_messages and received < 32 do
+        -- GetMessages() returns vector<string>; CONTROL 1.1.0's sol binding
+        -- throws while converting that vector. WaitForMessage returns one string.
+        local wait_ok, raw = pcall(function() return IPC.WaitForMessage(1) end)
+        if not wait_ok then
+            return nil, "IPC.WaitForMessage failed: " .. tostring(raw)
+        end
+        if type(raw) ~= "string" then
+            return nil, "IPC.WaitForMessage returned " .. type(raw)
+        end
+        messages[#messages + 1] = raw
+        received = received + 1
+
+        has_ok, has_messages = pcall(function() return IPC.HasMessages() end)
+        if not has_ok then
+            return nil, "IPC.HasMessages failed after receive: " .. tostring(has_messages)
+        end
+        if type(has_messages) ~= "boolean" then
+            return nil, "IPC.HasMessages returned " .. type(has_messages)
+        end
+    end
+    return messages, nil
+end
+
+local function start_capture_ipc_server(lifecycle_stage)
+    if not capture_enabled then
+        Log("EvoLab PoC IPC server skipped: " .. tostring(lifecycle_stage) .. " setting=false")
+        return
+    end
+    local ok, started = pcall(function() return IPC.StartServer(RESULT_CAPTURE_PIPE) end)
+    local start_error = nil
+    if not ok then
+        start_error = tostring(started)
+    elseif started ~= true then
+        start_error = "IPC.StartServer returned false"
+    end
+    capture_ipc_started = {
+        call_ok = ok,
+        started = started == true,
+        ok = ok and started == true,
+        error = start_error,
+    }
+    Log("EvoLab PoC IPC StartServer result: " .. ToJSON({
+        module_build = RESULT_CAPTURE_MODULE_BUILD,
+        lifecycle_stage = lifecycle_stage,
+        pipe = RESULT_CAPTURE_PIPE,
+        call_ok = capture_ipc_started.call_ok,
+        server_started = capture_ipc_started.started,
+        error = capture_ipc_started.error,
+    }))
+end
+
 function Load(playerId)
     Settings.AddBool("AutoDrive", true)
+    Settings.AddBool(RESULT_CAPTURE_SETTING, false)
     if playerId ~= 1 then
         return  -- 本模块只由玩家 1 的槽位驱动，其他槽位误挂时静默退出
     end
+    capture_enabled = Settings.GetBool(RESULT_CAPTURE_SETTING, false)
+    Log("EvoLab PoC lifecycle Load: " .. ToJSON({
+        module_build = RESULT_CAPTURE_MODULE_BUILD,
+        assigned_player_id = playerId,
+        capture_enabled = capture_enabled,
+        auto_drive = Settings.GetBool("AutoDrive", true),
+    }))
+    start_capture_ipc_server("Load")
     if not Settings.GetBool("AutoDrive", true) then
         Log("EvoLab: AutoDrive 已关闭，待机。")
         return
@@ -58,7 +207,17 @@ function Load(playerId)
         options:SetVictory(CFG.victory)
     end
     options:SetRecordGame(true)      -- 必须开录像：Python 战报解析依赖 .aoe2record
-    options:SetGameSpeed(CFG.speed)
+    if capture_enabled then
+        captured_game_speed_set = capture_call(function() return options:SetGameSpeed(CFG.speed) end)
+        captured_game_speed_readback = capture_value(function() return options:GetGameSpeed() end)
+        Log("EvoLab PoC speed set/readback: " .. ToJSON({
+            requested = CFG.speed,
+            set = captured_game_speed_set,
+            readback = captured_game_speed_readback,
+        }))
+    else
+        options:SetGameSpeed(CFG.speed)
+    end
     options:SetLockSpeed(true)
     options:SetPlayersCount(CFG.players)
     -- 三方各自为战
@@ -71,6 +230,11 @@ function Load(playerId)
 end
 
 function Init()
+    Log("EvoLab PoC lifecycle Init: " .. ToJSON({
+        module_build = RESULT_CAPTURE_MODULE_BUILD,
+        assigned_player_id = GetAssignedPlayerId(),
+        capture_enabled = capture_enabled,
+    }))
     if GetAssignedPlayerId() ~= 1 then
         return
     end
@@ -87,11 +251,128 @@ function Init()
     Log("EvoLab: 观察模式，已移除己方对象 " .. tostring(n) .. " 个")
 end
 
+function Update()
+    if not capture_enabled or not capture_ipc_started.ok then
+        return
+    end
+    capture_update_count = capture_update_count + 1
+    if capture_update_count == 1 then
+        Log("EvoLab PoC IPC Update polling started: " .. ToJSON({
+            module_build = RESULT_CAPTURE_MODULE_BUILD,
+            receive_mode = "HasMessages+WaitForMessage(1)",
+            message_batch_limit = 32,
+            update_count = capture_update_count,
+            server_started = capture_ipc_started.ok,
+        }))
+    end
+    local messages, receive_error = receive_capture_ipc_messages()
+    if receive_error ~= nil then
+        capture_receive_error_count = capture_receive_error_count + 1
+        if capture_receive_error_count == 1 or capture_receive_error_count % 60 == 0 then
+            Log("EvoLab PoC IPC receive failed: " .. ToJSON({
+                module_build = RESULT_CAPTURE_MODULE_BUILD,
+                receive_mode = "HasMessages+WaitForMessage(1)",
+                receive_error_count = capture_receive_error_count,
+                error = receive_error,
+            }))
+        end
+        messages = {}
+    end
+    for _, raw in ipairs(messages) do
+        local parsed = ParseJSON(raw)
+        if type(parsed) == "table" and parsed.action == "capture_hello"
+            and parsed.protocol_version == 1 then
+            capture_hello_count = capture_hello_count + 1
+            local ready_ok, queued = pcall(function()
+                return IPC.Send({ action = "capture_ready", protocol_version = 1,
+                    module_build = RESULT_CAPTURE_MODULE_BUILD })
+            end)
+            if ready_ok and queued == true then
+                if not capture_ready_logged or capture_hello_count % 10 == 0 then
+                    Log("EvoLab PoC IPC capture_ready queued after client hello: " .. ToJSON({
+                        module_build = RESULT_CAPTURE_MODULE_BUILD,
+                        hello_count = capture_hello_count,
+                        update_count = capture_update_count,
+                    }))
+                    capture_ready_logged = true
+                end
+            else
+                Log("EvoLab PoC IPC capture_ready send failed: " .. ToJSON({
+                    module_build = RESULT_CAPTURE_MODULE_BUILD,
+                    hello_count = capture_hello_count,
+                    update_count = capture_update_count,
+                    error = tostring(queued),
+                }))
+            end
+        elseif type(parsed) == "table" and parsed.action == "bind_match"
+            and type(parsed.match_id) == "string" and parsed.match_id ~= ""
+            and (capture_match_id == nil or capture_match_id == parsed.match_id) then
+            local sent_ok, queued = pcall(function()
+                return IPC.Send({ action = "match_bound", match_id = parsed.match_id })
+            end)
+            if sent_ok and queued == true then
+                capture_match_id = parsed.match_id
+                Log("EvoLab PoC runner match_id bound: " .. capture_match_id)
+            else
+                Log("EvoLab PoC IPC binding acknowledgement failed: " .. tostring(queued))
+            end
+        else
+            Log("EvoLab PoC IPC binding rejected")
+        end
+    end
+    -- Read-only heartbeat: lets the runner distinguish an idle Update callback
+    -- from inbound routing drops without treating telemetry as handshake readiness.
+    if capture_update_count == 1 or capture_update_count % 300 == 0 then
+        local stats = capture_value(function() return IPC.GetStats() end)
+        local telemetry = {
+            action = "capture_update_heartbeat",
+            module_build = RESULT_CAPTURE_MODULE_BUILD,
+            update_count = capture_update_count,
+            hello_count = capture_hello_count,
+            ipc_stats = stats,
+        }
+        local heartbeat_ok, queued = pcall(function() return IPC.Send(telemetry) end)
+        Log("EvoLab PoC IPC Update telemetry: " .. ToJSON({
+            module_build = RESULT_CAPTURE_MODULE_BUILD,
+            update_count = capture_update_count,
+            hello_count = capture_hello_count,
+            ipc_stats = stats,
+            send_call_ok = heartbeat_ok,
+            queued = queued,
+        }))
+    end
+end
+
 function End(hasWon)
     if GetAssignedPlayerId() ~= 1 then
         return
     end
     if not Settings.GetBool("AutoDrive", true) then
+        return
+    end
+    if capture_enabled then
+        capture_sequence = capture_sequence + 1
+        local observation = {
+            schema_version = 1,
+            capture_sequence = capture_sequence,
+            match_id = capture_match_id,
+            callback_has_won = capture_value(function() return hasWon end),
+            game_time_seconds = capture_value(GetGameTime),
+            game_speed_set = captured_game_speed_set,
+            game_speed_readback = captured_game_speed_readback,
+            victory_player = capture_victory_player(),
+            players = { capture_player(2), capture_player(3) },
+        }
+        local raw_sentinel = RESULT_CAPTURE_PREFIX .. ToJSON(observation)
+        Log(raw_sentinel)
+        if capture_ipc_started.ok then
+            local sent_ok, queued = pcall(function() return IPC.Send(raw_sentinel) end)
+            Log("EvoLab PoC IPC send: " .. ToJSON({ call_ok = sent_ok, queued = queued }))
+        else
+            Log("EvoLab PoC IPC unavailable; raw sentinel was not delivered: " ..
+                tostring(capture_ipc_started.error))
+        end
+        Log("EvoLab PoC 已采集本局原始终局字段；本次未自动启动下一局。")
         return
     end
     Log("EvoLab: 本局结束，自动开下一局")

@@ -37,7 +37,7 @@ pip install -r ai_lab/requirements.txt
 {
   "game": {
     "install_dir": "C:\\Steam\\steamapps\\common\\AoE2DE",        // ← 你的游戏路径
-    "recordings_dir": "C:\\Users\\<you>\\Games\\Age of Empires 2 DE\\<profile>\\savegame\\multi"
+    "recordings_dir": ""
   },
   "evolution": { "population": 8, "matches_per_ai": 3, "mutation_rate": 0.35, ... },
   "control": { "launcher": "tools/AoE2Control/AoE2Control.exe" }
@@ -45,6 +45,8 @@ pip install -r ai_lab/requirements.txt
 ```
 
 > 💡 找不到录像目录？打开游戏打一局，看 `%USERPROFILE%\Games\Age of Empires 2 DE\<profile id>\savegame\` 下哪个子目录多了 `.aoe2record`。
+
+`recordings_dir` 留空时，脚本会从 `%USERPROFILE%` 自动检查 `Games\Age of Empires 2 DE\<profile>\savegame` 及 `Documents\My Games\Age of Empires 2 DE\<profile>\savegame` 下的录像。若游戏使用其他位置，可在此填写具体录像目录。
 
 ### 1.4 第一次跑（半自动，2 分钟上手）
 

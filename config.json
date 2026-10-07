@@ -4,7 +4,7 @@
     "exe": "AoE2DE_s.exe",
     "ai_dir": "C:\\Steam\\steamapps\\common\\AoE2DE\\resources\\_common\\ai",
     "base_script": "AiBuilder.per",
-    "recordings_dir": "C:\\Users\\fengy\\Games\\Age of Empires 2 DE\\76561198222089992\\savegame\\multi"
+    "recordings_dir": ""
   },
   "match": {
     "difficulty": "hard",

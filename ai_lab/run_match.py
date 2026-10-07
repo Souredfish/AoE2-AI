@@ -31,6 +31,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).parent))
 import genome as G  # noqa: E402
 import make_ai as MK  # noqa: E402
+import recordings as REC  # noqa: E402
 
 
 def load_config():
@@ -39,11 +40,7 @@ def load_config():
 
 
 def snapshot_latest_record(cfg):
-    rec_dir = Path(cfg["game"]["recordings_dir"])
-    if not rec_dir.exists():
-        return None
-    records = sorted(rec_dir.glob("*.aoe2record"), key=lambda p: p.stat().st_mtime)
-    return records[-1] if records else None
+    return REC.latest_recording(cfg)
 
 
 def launch_game(cfg):

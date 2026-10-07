@@ -16,6 +16,11 @@ import sys
 import time
 from pathlib import Path
 
+try:
+    from .recordings import latest_recording, recording_directories
+except ImportError:  # Script execution from ai_lab/ on Windows.
+    from recordings import latest_recording, recording_directories
+
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -25,13 +30,11 @@ def load_config():
 
 
 def find_latest_record(cfg):
-    rec_dir = Path(cfg["game"]["recordings_dir"])
-    if not rec_dir.exists():
-        sys.exit("录像目录不存在: %s" % rec_dir)
-    records = sorted(rec_dir.glob("*.aoe2record"), key=lambda p: p.stat().st_mtime)
-    if not records:
-        sys.exit("录像目录里没有对局录像，先打一局吧。目录: %s" % rec_dir)
-    return records[-1]
+    record = latest_recording(cfg)
+    if record is None:
+        dirs = ", ".join(str(p) for p in recording_directories(cfg))
+        sys.exit("没有找到 .aoe2record 录像。已检查目录: %s；请核对 config.json 的 game.recordings_dir" % (dirs or "未配置"))
+    return record
 
 
 def parse_record(path):
@@ -50,8 +53,8 @@ def parse_record(path):
     except Exception:
         info["map"] = "?"
     try:
-        dur = s.get_duration()
-        info["duration_min"] = round(dur / 60.0, 1) if dur else None
+        duration_ms = s.get_duration()
+        info["duration_min"] = round(duration_ms / 60000.0, 1) if duration_ms else None
     except Exception:
         info["duration_min"] = None
     try:
@@ -63,17 +66,22 @@ def parse_record(path):
     try:
         for p in s.get_players():
             entry = {
+                # mgz exposes this as player_number/number; do not infer a
+                # slot from list order when empty AI names require slot mapping.
+                "slot": p.get("number"),
                 "name": p.get("name", "?"),
                 "civ": p.get("civilization", "?"),
                 "color": p.get("color_id"),
                 "human": p.get("human"),
             }
+            if "user_id" in p:
+                entry["user_id"] = p["user_id"]
             # mgz 的 winner 字段（来自 postgame）不一定存在
             if "winner" in p and p["winner"] is not None:
                 entry["winner"] = bool(p["winner"])
             players.append(entry)
     except Exception as e:
-        print("[警告] 玩家解析失败: %s" % e)
+        raise ValueError("mgz 无法解析录像玩家信息；请确认 mgz 版本支持该游戏 build。原始错误: %s" % e) from e
 
     info["players"] = players
 
@@ -107,13 +115,15 @@ def parse_record(path):
 def fmt_duration(mins):
     if mins is None:
         return "?"
-    return "%d分%02d秒" % (mins, (mins % 1) * 60)
+    total_seconds = max(0, int(round(float(mins) * 60)))
+    minutes, seconds = divmod(total_seconds, 60)
+    return "%d分%02d秒" % (minutes, seconds)
 
 
 def render_markdown(info):
     lines = []
-    lines.append("# 战报：%s vs %s" % (
-        " vs ".join(p["name"] for p in info["players"][:2]) or "未知对局"))
+    matchup = " vs ".join(p["name"] for p in info["players"][:2]) or "未知对局"
+    lines.append("# 战报：%s" % matchup)
     lines.append("")
     lines.append("- 地图: %s" % info.get("map", "?"))
     lines.append("- 时长: %s" % fmt_duration(info.get("duration_min")))

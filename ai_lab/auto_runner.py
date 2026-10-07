@@ -399,36 +399,126 @@ def list_recordings(cfg):
     return REC.list_recordings(cfg)
 
 
-def wait_new_recording(cfg, before, timeout_min):
-    deadline = time.time() + timeout_min * 60
-    while time.time() < deadline:
-        now = recording_snapshot(cfg)
-        new_keys = unique_new_recording_paths(before, now)
-        if len(new_keys) > 1:
-            raise ValueError("本局录像关联不唯一：快照后出现多个新录像")
+def wait_new_recording(cfg, before, timeout_min, *, diagnostic=None,
+                       match_id=None, poll_interval_s=5, settle_interval_s=3,
+                       clock=time.monotonic, sleep=time.sleep):
+    """Wait for exactly one new replay, logging every discovery/settle decision.
+
+    ``diagnostic`` is deliberately a read-only observer. It cannot change the
+    association decision, which remains fail-closed when candidates are
+    ambiguous or disappear while settling. Clock/sleep injection keeps the
+    retry and timeout paths deterministic in tests.
+    """
+    started = clock()
+    deadline = started + timeout_min * 60
+    iteration = 0
+
+    def emit(event, **fields):
+        if diagnostic is None:
+            return
+        payload = {"event": event, **fields}
+        if match_id is not None:
+            payload["match_id"] = match_id
+        try:
+            diagnostic(payload)
+        except Exception:
+            # Diagnostics must never make a file association succeed/fail.
+            pass
+
+    emit("recording_wait_started", timeout_min=timeout_min,
+         baseline_count=len(before), baseline_keys=sorted(before))
+    last_new_keys = []
+    while clock() < deadline:
+        iteration += 1
+        try:
+            now = recording_snapshot(cfg, diagnostic=diagnostic,
+                                     diagnostic_context={"iteration": iteration,
+                                                         "phase": "poll"})
+        except Exception as exc:
+            emit("recording_snapshot_error", iteration=iteration, phase="poll",
+                 error_type=type(exc).__name__, error=str(exc))
+            raise
+        try:
+            new_keys = unique_new_recording_paths(before, now)
+        except ValueError as exc:
+            emit("recording_association_rejected", iteration=iteration,
+                 phase="poll", snapshot_count=len(now), new_keys=sorted(set(now) - set(before)),
+                 error_type=type(exc).__name__, error=str(exc))
+            raise
+        last_new_keys = new_keys
+        emit("recording_poll", iteration=iteration, elapsed_s=round(clock() - started, 3),
+             snapshot_count=len(now), new_keys=new_keys,
+             new_stats={key: now[key] for key in new_keys})
+
         if new_keys:
             key = new_keys[0]
             first_stat = now[key]
-            time.sleep(3)  # 等游戏完成录像写入
-            settled = recording_snapshot(cfg)
-            settled_keys = unique_new_recording_paths(before, settled)
-            if settled_keys != [key]:
-                if len(settled_keys) > 1:
-                    raise ValueError("本局录像关联不唯一：快照后出现多个新录像")
-                continue
-            if settled[key] == first_stat:
-                return list_recordings(cfg)[key]
-        time.sleep(5)
+            sleep(settle_interval_s)  # 等游戏完成录像写入
+            try:
+                settled = recording_snapshot(
+                    cfg, diagnostic=diagnostic,
+                    diagnostic_context={"iteration": iteration, "phase": "settle"})
+            except Exception as exc:
+                emit("recording_snapshot_error", iteration=iteration, phase="settle",
+                     candidate=key, first_stat=first_stat,
+                     error_type=type(exc).__name__, error=str(exc))
+                raise
+            try:
+                settled_keys = unique_new_recording_paths(before, settled)
+            except ValueError as exc:
+                emit("recording_association_rejected", iteration=iteration,
+                     phase="settle", candidate=key, first_stat=first_stat,
+                     settled_new_keys=sorted(set(settled) - set(before)),
+                     error_type=type(exc).__name__, error=str(exc))
+                raise
+
+            settled_stat = settled.get(key)
+            is_settled = settled_keys == [key] and settled_stat == first_stat
+            emit("recording_settled_check", iteration=iteration, candidate=key,
+                 first_stat=first_stat, settled_stat=settled_stat,
+                 settled_new_keys=settled_keys, settled=is_settled,
+                 reason=(None if is_settled else
+                         "candidate_set_changed" if settled_keys != [key] else
+                         "stat_changed_or_candidate_missing"))
+            if is_settled:
+                try:
+                    path = list_recordings(cfg)[key]
+                except Exception as exc:
+                    emit("recording_candidate_lookup_error", iteration=iteration,
+                         candidate=key, first_stat=first_stat, settled_stat=settled_stat,
+                         error_type=type(exc).__name__, error=str(exc))
+                    # The file may have moved/disappeared between snapshot and
+                    # lookup. Retry within the original deadline; do not infer.
+                else:
+                    emit("recording_associated_candidate", iteration=iteration,
+                         candidate=key, first_stat=first_stat, settled_stat=settled_stat)
+                    return path
+        sleep(poll_interval_s)
+
+    emit("recording_wait_timeout", iterations=iteration,
+         elapsed_s=round(clock() - started, 3), last_new_keys=last_new_keys)
     return None
 
 
-def recording_snapshot(cfg):
+def recording_snapshot(cfg, *, diagnostic=None, diagnostic_context=None):
     """Capture stable file signatures before a match can create its replay."""
     snapshot = {}
     for key, path in list_recordings(cfg).items():
         try:
             stat = path.stat()
-        except OSError:
+        except OSError as exc:
+            if diagnostic is not None:
+                payload = {
+                    "event": "recording_stat_error",
+                    "path": str(path),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                    **(diagnostic_context or {}),
+                }
+                try:
+                    diagnostic(payload)
+                except Exception:
+                    pass
             continue
         snapshot[key] = {"size_bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns}
     return snapshot
@@ -777,7 +867,13 @@ def main():
             installed["B"]["genome"], installed["B"]["per_sha256"]))
 
         try:
-            rec = wait_new_recording(cfg, before, timeout_min)
+            def log_recording_probe(event):
+                print("[录像探测] " + json.dumps(event, ensure_ascii=False,
+                                               sort_keys=True))
+
+            rec = wait_new_recording(
+                cfg, before, timeout_min, diagnostic=log_recording_probe,
+                match_id=match["match_id"])
         except ValueError as e:
             append_runner_evidence(gen, {
                 "event": "recording_rejected", "match_id": match["match_id"],

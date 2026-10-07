@@ -183,6 +183,33 @@ class RecordingWaitTests(unittest.TestCase):
                         if event["event"] == "recording_deadline_expired")
         self.assertEqual(deadline["phase"], "after_settle_wait")
 
+    def test_settle_sleep_is_clamped_to_two_seconds_remaining(self):
+        path = object()
+
+        def discover_candidate(_cfg, **_kwargs):
+            # timeout_min=0.1 gives a six-second deadline; discovery itself
+            # consumes four seconds, leaving exactly two before settle.
+            self.clock.value = 4
+            return {**self.before, "new.aoe2record": self.signature}
+
+        with patch.object(auto_runner, "recording_snapshot",
+                          side_effect=discover_candidate) as snapshot, \
+                patch.object(auto_runner, "list_recordings",
+                             return_value={"new.aoe2record": path}) as lookup:
+            result = auto_runner.wait_new_recording(
+                {}, self.before, 0.1, diagnostic=self.events.append,
+                clock=self.clock.now, sleep=self.clock.sleep,
+                poll_interval_s=5, settle_interval_s=6)
+
+        self.assertIsNone(result)
+        self.assertEqual(self.clock.sleeps, [2])
+        self.assertEqual(self.clock.now(), 6)
+        self.assertEqual(snapshot.call_count, 1)
+        lookup.assert_not_called()
+        deadline = next(event for event in self.events
+                        if event["event"] == "recording_deadline_expired")
+        self.assertEqual(deadline["phase"], "after_settle_wait")
+
     def test_deadline_is_rechecked_after_candidate_lookup_before_return(self):
         path = object()
 

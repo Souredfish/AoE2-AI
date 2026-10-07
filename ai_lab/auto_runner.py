@@ -904,6 +904,7 @@ def main():
         sys.exit("[拒绝] 启动前录像基线不完整，未部署/启动本场：%s" % exc)
     if not control_ready:
         sys.exit(1)
+    session_recording_baseline = dict(initial_recording_baseline)
 
     # ---- CONTROL 模块配置 ----
     ok, why = check_module_assigned()
@@ -952,29 +953,12 @@ def main():
             sys.exit("[拒绝] 赛程参赛名无效: %s" % match)
         print("[对局 %d/%d] EvoAI_G%dP%d  vs  EvoAI_G%dP%d"
               % (done + idx + 1, len(manifest["matches"]), gen, a, gen, b))
-        # Capture exactly what existed before this match, then record installed
-        # identities before waiting for a replay to appear.
-        if idx == 0:
-            baseline_captured_at_ns = initial_baseline_captured_at_ns
-            before = initial_recording_baseline
-        else:
-            baseline_captured_at_ns = time.time_ns()
-            try:
-                before = recording_snapshot(
-                    cfg, diagnostic=log_recording_probe,
-                    diagnostic_context={"phase": "baseline", "match_id": match["match_id"]},
-                    strict=True)
-            except Exception as exc:
-                if capture_receiver is not None:
-                    capture_receiver.stop()
-                sys.exit("[拒绝] 本场录像基线不完整：%s" % exc)
-            log_recording_probe({
-                "event": "recording_baseline_complete",
-                "match_id": match["match_id"],
-                "captured_at_ns": baseline_captured_at_ns,
-                "recording_count": len(before),
-                "keys": sorted(before),
-            })
+        # Reuse the complete pre-start snapshot, extending it only with replay
+        # paths already associated to earlier schedule entries. The driver can
+        # start another game before this loop advances, so a fresh disk snapshot
+        # here could incorrectly absorb that next match's recording.
+        baseline_captured_at_ns = initial_baseline_captured_at_ns
+        before = dict(session_recording_baseline)
         MK.install("A", {k: v for k, v in gene_pop[a].items()}, cfg)
         MK.install("B", {k: v for k, v in gene_pop[b].items()}, cfg)
         ai_dir = Path(cfg["game"]["ai_dir"])
@@ -1093,6 +1077,10 @@ def main():
             break
         winner_name = result["winners"][0]
         print("[结果] 胜者: %s" % winner_name)
+        session_recording_baseline[rec_key] = {
+            "size_bytes": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+        }
     else:
         print()
         print("[完成] 本次赛程全部跑完！")

@@ -22,14 +22,17 @@ class RecordingWaitTests(unittest.TestCase):
         self.before = {"old.aoe2record": {"size_bytes": 10, "mtime_ns": 1}}
         self.signature = {"size_bytes": 20, "mtime_ns": 2}
 
-    def _wait(self, snapshots):
+    def _wait(self, snapshots, *, timeout_min=1, settle_interval_s=3,
+              lookup=None):
         path = object()
         with patch.object(auto_runner, "recording_snapshot", side_effect=snapshots), \
                 patch.object(auto_runner, "list_recordings",
-                             return_value={"new.aoe2record": path}):
+                             side_effect=lookup or
+                             (lambda _cfg: {"new.aoe2record": path})):
             result = auto_runner.wait_new_recording(
-                {}, self.before, 1, diagnostic=self.events.append,
-                match_id="g0-m0001", poll_interval_s=5, settle_interval_s=3,
+                {}, self.before, timeout_min, diagnostic=self.events.append,
+                match_id="g0-m0001", poll_interval_s=5,
+                settle_interval_s=settle_interval_s,
                 clock=self.clock.now, sleep=self.clock.sleep)
         return result
 
@@ -115,6 +118,105 @@ class RecordingWaitTests(unittest.TestCase):
         self.assertEqual(error["iteration"], 4)
         self.assertEqual(error["path"], "blocked.aoe2record")
         self.assertEqual(error["error_type"], "PermissionError")
+
+    def test_incomplete_pre_match_baseline_fails_closed(self):
+        class UnreadablePath:
+            def stat(self):
+                raise PermissionError("sharing violation")
+
+            def __str__(self):
+                return "old.aoe2record"
+
+        with patch.object(auto_runner, "list_recordings",
+                          return_value={"old.aoe2record": UnreadablePath()}):
+            with self.assertRaisesRegex(OSError, "基线|快照"):
+                auto_runner.recording_snapshot(
+                    {}, diagnostic=self.events.append,
+                    diagnostic_context={"phase": "baseline"}, strict=True)
+
+        self.assertEqual(self.events[0]["event"], "recording_stat_error")
+        self.assertEqual(self.events[0]["phase"], "baseline")
+
+    def test_locked_candidate_cannot_switch_after_disappearing(self):
+        path_a = "new-a.aoe2record"
+        path_b = "new-b.aoe2record"
+        with patch.object(auto_runner, "recording_snapshot", side_effect=[
+                {**self.before, path_a: self.signature},
+                dict(self.before),
+                {**self.before, path_b: self.signature},
+        ]):
+            with patch.object(auto_runner, "list_recordings", return_value={}):
+                with self.assertRaisesRegex(ValueError, "拒绝切换"):
+                    auto_runner.wait_new_recording(
+                        {}, self.before, 1, diagnostic=self.events.append,
+                        clock=self.clock.now, sleep=self.clock.sleep,
+                        poll_interval_s=1, settle_interval_s=1)
+
+        locked = next(event for event in self.events
+                      if event["event"] == "recording_candidate_locked")
+        rejected = next(event for event in self.events
+                        if event["event"] == "recording_association_rejected")
+        self.assertEqual(locked["candidate"], path_a)
+        self.assertEqual(rejected["candidate"], path_a)
+        self.assertEqual(rejected["new_keys"], [path_b])
+
+    def test_settle_finishing_at_deadline_does_not_return_candidate(self):
+        path = object()
+        with patch.object(auto_runner, "recording_snapshot", return_value={
+                **self.before, "new.aoe2record": self.signature,
+        }) as snapshot, patch.object(auto_runner, "list_recordings",
+                                    return_value={"new.aoe2record": path}) as lookup:
+            result = auto_runner.wait_new_recording(
+                {}, self.before, 0.1, diagnostic=self.events.append,
+                clock=self.clock.now, sleep=self.clock.sleep,
+                poll_interval_s=1, settle_interval_s=6)
+
+        self.assertIsNone(result)
+        self.assertEqual(snapshot.call_count, 1)
+        lookup.assert_not_called()
+        deadline = next(event for event in self.events
+                        if event["event"] == "recording_deadline_expired")
+        self.assertEqual(deadline["phase"], "after_settle_wait")
+
+    def test_deadline_is_rechecked_after_candidate_lookup_before_return(self):
+        path = object()
+
+        def lookup(_cfg):
+            self.clock.value = 60
+            return {"new.aoe2record": path}
+
+        result = self._wait([
+            {**self.before, "new.aoe2record": self.signature},
+            {**self.before, "new.aoe2record": self.signature},
+        ], lookup=lookup)
+
+        self.assertIsNone(result)
+        deadline = next(event for event in self.events
+                        if event["event"] == "recording_deadline_expired")
+        self.assertEqual(deadline["phase"], "before_return")
+
+    def test_deadline_is_checked_immediately_before_return(self):
+        path = object()
+
+        def diagnostic(event):
+            self.events.append(event)
+            if event["event"] == "recording_associated_candidate":
+                self.clock.value = 60
+
+        with patch.object(auto_runner, "recording_snapshot", side_effect=[
+                {**self.before, "new.aoe2record": self.signature},
+                {**self.before, "new.aoe2record": self.signature},
+        ]), patch.object(auto_runner, "list_recordings",
+                         return_value={"new.aoe2record": path}):
+            result = auto_runner.wait_new_recording(
+                {}, self.before, 1, diagnostic=diagnostic,
+                clock=self.clock.now, sleep=self.clock.sleep,
+                poll_interval_s=1, settle_interval_s=1)
+
+        self.assertIsNone(result)
+        deadline = next(event for event in self.events
+                        if event["event"] == "recording_deadline_expired")
+        self.assertEqual(deadline["phase"], "immediately_before_return")
 
 
 if __name__ == "__main__":

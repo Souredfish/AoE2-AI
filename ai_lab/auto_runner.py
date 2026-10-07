@@ -428,6 +428,7 @@ def wait_new_recording(cfg, before, timeout_min, *, diagnostic=None,
     emit("recording_wait_started", timeout_min=timeout_min,
          baseline_count=len(before), baseline_keys=sorted(before))
     last_new_keys = []
+    candidate_key = None
     while clock() < deadline:
         iteration += 1
         try:
@@ -448,12 +449,36 @@ def wait_new_recording(cfg, before, timeout_min, *, diagnostic=None,
         last_new_keys = new_keys
         emit("recording_poll", iteration=iteration, elapsed_s=round(clock() - started, 3),
              snapshot_count=len(now), new_keys=new_keys,
-             new_stats={key: now[key] for key in new_keys})
+             new_stats={key: now[key] for key in new_keys},
+             locked_candidate=candidate_key)
 
-        if new_keys:
-            key = new_keys[0]
+        if clock() >= deadline:
+            emit("recording_deadline_expired", iteration=iteration,
+                 phase="after_poll", remaining_s=0, new_keys=new_keys,
+                 locked_candidate=candidate_key)
+            break
+
+        if candidate_key is not None and new_keys and new_keys != [candidate_key]:
+            error = ValueError("录像候选已锁定为 %s，拒绝切换到 %s" %
+                               (candidate_key, ", ".join(new_keys)))
+            emit("recording_association_rejected", iteration=iteration,
+                 phase="poll", candidate=candidate_key, new_keys=new_keys,
+                 error_type=type(error).__name__, error=str(error))
+            raise error
+        if candidate_key is None and new_keys:
+            candidate_key = new_keys[0]
+            emit("recording_candidate_locked", iteration=iteration,
+                 candidate=candidate_key, first_stat=now[candidate_key])
+
+        if candidate_key is not None and candidate_key in now:
+            key = candidate_key
             first_stat = now[key]
             sleep(settle_interval_s)  # 等游戏完成录像写入
+            if clock() >= deadline:
+                emit("recording_deadline_expired", iteration=iteration,
+                     phase="after_settle_wait", candidate=key,
+                     first_stat=first_stat, remaining_s=0)
+                break
             try:
                 settled = recording_snapshot(
                     cfg, diagnostic=diagnostic,
@@ -472,6 +497,15 @@ def wait_new_recording(cfg, before, timeout_min, *, diagnostic=None,
                      error_type=type(exc).__name__, error=str(exc))
                 raise
 
+            if settled_keys and settled_keys != [key]:
+                error = ValueError("录像候选已锁定为 %s，settle 时发现其他新路径：%s" %
+                                   (key, ", ".join(settled_keys)))
+                emit("recording_association_rejected", iteration=iteration,
+                     phase="settle", candidate=key, first_stat=first_stat,
+                     settled_new_keys=settled_keys,
+                     error_type=type(error).__name__, error=str(error))
+                raise error
+
             settled_stat = settled.get(key)
             is_settled = settled_keys == [key] and settled_stat == first_stat
             emit("recording_settled_check", iteration=iteration, candidate=key,
@@ -481,6 +515,13 @@ def wait_new_recording(cfg, before, timeout_min, *, diagnostic=None,
                          "candidate_set_changed" if settled_keys != [key] else
                          "stat_changed_or_candidate_missing"))
             if is_settled:
+                remaining_s = deadline - clock()
+                if remaining_s <= 0:
+                    emit("recording_deadline_expired", iteration=iteration,
+                         phase="before_candidate_lookup", candidate=key,
+                         first_stat=first_stat, settled_stat=settled_stat,
+                         remaining_s=0)
+                    break
                 try:
                     path = list_recordings(cfg)[key]
                 except Exception as exc:
@@ -490,8 +531,22 @@ def wait_new_recording(cfg, before, timeout_min, *, diagnostic=None,
                     # The file may have moved/disappeared between snapshot and
                     # lookup. Retry within the original deadline; do not infer.
                 else:
+                    remaining_s = deadline - clock()
+                    if remaining_s <= 0:
+                        emit("recording_deadline_expired", iteration=iteration,
+                             phase="before_return", candidate=key,
+                             first_stat=first_stat, settled_stat=settled_stat,
+                             remaining_s=0)
+                        break
                     emit("recording_associated_candidate", iteration=iteration,
                          candidate=key, first_stat=first_stat, settled_stat=settled_stat)
+                    remaining_s = deadline - clock()
+                    if remaining_s <= 0:
+                        emit("recording_deadline_expired", iteration=iteration,
+                             phase="immediately_before_return", candidate=key,
+                             first_stat=first_stat, settled_stat=settled_stat,
+                             remaining_s=0)
+                        break
                     return path
         sleep(poll_interval_s)
 
@@ -500,7 +555,7 @@ def wait_new_recording(cfg, before, timeout_min, *, diagnostic=None,
     return None
 
 
-def recording_snapshot(cfg, *, diagnostic=None, diagnostic_context=None):
+def recording_snapshot(cfg, *, diagnostic=None, diagnostic_context=None, strict=False):
     """Capture stable file signatures before a match can create its replay."""
     snapshot = {}
     for key, path in list_recordings(cfg).items():
@@ -519,6 +574,8 @@ def recording_snapshot(cfg, *, diagnostic=None, diagnostic_context=None):
                     diagnostic(payload)
                 except Exception:
                     pass
+            if strict:
+                raise OSError("无法完整采集录像快照：%s: %s" % (path, exc)) from exc
             continue
         snapshot[key] = {"size_bytes": stat.st_size, "mtime_ns": stat.st_mtime_ns}
     return snapshot
@@ -811,6 +868,10 @@ def main():
 
     timeout_min = int(cfg.get("control", {}).get("auto_match_timeout_min", 150))
     capture_receiver = None
+
+    def log_recording_probe(event):
+        print("[录像探测] " + json.dumps(event, ensure_ascii=False, sort_keys=True))
+
     if args.capture_only:
         raw_path = raw_capture_path(LAB / "runner_evidence", schedule[0]["match_id"])
         def log_capture_ipc(event):
@@ -840,7 +901,22 @@ def main():
         # Capture exactly what existed before this match, then record installed
         # identities before waiting for a replay to appear.
         baseline_captured_at_ns = time.time_ns()
-        before = recording_snapshot(cfg)
+        try:
+            before = recording_snapshot(
+                cfg, diagnostic=log_recording_probe,
+                diagnostic_context={"phase": "baseline", "match_id": match["match_id"]},
+                strict=True)
+        except Exception as exc:
+            if capture_receiver is not None:
+                capture_receiver.stop()
+            sys.exit("[拒绝] 赛前录像基线不完整，未启动本场：%s" % exc)
+        log_recording_probe({
+            "event": "recording_baseline_complete",
+            "match_id": match["match_id"],
+            "captured_at_ns": baseline_captured_at_ns,
+            "recording_count": len(before),
+            "keys": sorted(before),
+        })
         MK.install("A", {k: v for k, v in gene_pop[a].items()}, cfg)
         MK.install("B", {k: v for k, v in gene_pop[b].items()}, cfg)
         ai_dir = Path(cfg["game"]["ai_dir"])
@@ -867,10 +943,6 @@ def main():
             installed["B"]["genome"], installed["B"]["per_sha256"]))
 
         try:
-            def log_recording_probe(event):
-                print("[录像探测] " + json.dumps(event, ensure_ascii=False,
-                                               sort_keys=True))
-
             rec = wait_new_recording(
                 cfg, before, timeout_min, diagnostic=log_recording_probe,
                 match_id=match["match_id"])
